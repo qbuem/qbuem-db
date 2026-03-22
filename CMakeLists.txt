@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(qbuem-db VERSION 1.0.0 LANGUAGES C CXX)
+project(qbuem-db VERSION 2.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(FetchContent)
 include(ExternalProject)
+
+# ── 옵션 ──────────────────────────────────────────────────────────────────────
+option(QBUEM_DB_MYSQL   "MySQL/MariaDB 드라이버 빌드" ON)
+option(QBUEM_DB_REDIS   "Redis 클라이언트 빌드"       ON)
 
 # ── qbuem-stack ───────────────────────────────────────────────────────────────
 set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -93,6 +97,66 @@ target_link_libraries(qbuem_db_postgresql PUBLIC
 )
 add_library(qbuem-db::postgresql_driver ALIAS qbuem_db_postgresql)
 
+# ── MySQL / MariaDB driver ────────────────────────────────────────────────────
+if(QBUEM_DB_MYSQL)
+    # 시스템 libmysqlclient 탐색
+    find_library(MYSQL_CLIENT_LIB NAMES mysqlclient mysqlclient_r
+        HINTS
+            /usr/lib/x86_64-linux-gnu
+            /usr/lib/aarch64-linux-gnu
+            /usr/local/lib
+            /usr/lib/mysql
+            /usr/local/mysql/lib
+    )
+    find_path(MYSQL_INCLUDE_DIR NAMES mysql/mysql.h mysql.h
+        HINTS
+            /usr/include
+            /usr/local/include
+            /usr/include/mysql
+            /usr/local/mysql/include
+    )
+
+    if(MYSQL_CLIENT_LIB AND MYSQL_INCLUDE_DIR)
+        message(STATUS "MySQL client found: ${MYSQL_CLIENT_LIB}")
+        add_library(MySQL::MySQL UNKNOWN IMPORTED)
+        set_target_properties(MySQL::MySQL PROPERTIES
+            IMPORTED_LOCATION             "${MYSQL_CLIENT_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${MYSQL_INCLUDE_DIR}"
+        )
+
+        add_library(qbuem_db_mysql STATIC
+            src/db/mysql_driver.cpp
+        )
+        target_include_directories(qbuem_db_mysql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(qbuem_db_mysql PUBLIC
+            MySQL::MySQL
+            qbuem-stack::reactor
+            qbuem-stack::result
+        )
+        add_library(qbuem-db::mysql_driver ALIAS qbuem_db_mysql)
+        message(STATUS "qbuem-db::mysql_driver enabled")
+    else()
+        message(STATUS "MySQL client not found — qbuem-db::mysql_driver skipped")
+        message(STATUS "  apt install libmysqlclient-dev  (Debian/Ubuntu)")
+        message(STATUS "  dnf install mysql-devel         (RHEL/Fedora)")
+        set(QBUEM_DB_MYSQL OFF)
+    endif()
+endif()
+
+# ── Redis client ──────────────────────────────────────────────────────────────
+if(QBUEM_DB_REDIS)
+    add_library(qbuem_db_redis STATIC
+        src/db/redis_client.cpp
+    )
+    target_include_directories(qbuem_db_redis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(qbuem_db_redis PUBLIC
+        qbuem-stack::reactor
+        qbuem-stack::result
+    )
+    add_library(qbuem-db::redis_client ALIAS qbuem_db_redis)
+    message(STATUS "qbuem-db::redis_client enabled")
+endif()
+
 # ── ORM (header-only) ─────────────────────────────────────────────────────────
 add_library(qbuem_db_orm INTERFACE)
 target_include_directories(qbuem_db_orm INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -101,3 +165,28 @@ target_link_libraries(qbuem_db_orm INTERFACE
     qbuem-stack::result
 )
 add_library(qbuem-db::orm ALIAS qbuem_db_orm)
+
+# ── Migration (header-only) ───────────────────────────────────────────────────
+add_library(qbuem_db_migration INTERFACE)
+target_include_directories(qbuem_db_migration INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(qbuem_db_migration INTERFACE
+    qbuem-stack::reactor
+    qbuem-stack::result
+)
+add_library(qbuem-db::migration ALIAS qbuem_db_migration)
+
+# ── 요약 출력 ─────────────────────────────────────────────────────────────────
+message(STATUS "")
+message(STATUS "── qbuem-db v${PROJECT_VERSION} ─────────────────────")
+message(STATUS "  qbuem-db::orm              (header-only ORM)")
+message(STATUS "  qbuem-db::migration        (header-only migration runner)")
+message(STATUS "  qbuem-db::sqlite3_driver   (SQLite3 amalgamation)")
+message(STATUS "  qbuem-db::postgresql_driver(async libpq)")
+if(QBUEM_DB_MYSQL)
+    message(STATUS "  qbuem-db::mysql_driver     (MySQL/MariaDB libmysqlclient)")
+endif()
+if(QBUEM_DB_REDIS)
+    message(STATUS "  qbuem-db::redis_client     (async Redis RESP2)")
+endif()
+message(STATUS "─────────────────────────────────────────────")
+message(STATUS "")

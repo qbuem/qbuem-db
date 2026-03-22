@@ -1,76 +1,108 @@
 # qbuem-db
 
-qbuem-stack 기반 C++23 DB 드라이버 + ORM 라이브러리.
-PostgreSQL (libpq 비동기) + SQLite3 (amalgamation) 드라이버와 헤더 전용 ORM을 제공한다.
+qbuem-stack 기반 C++23 DB 드라이버 + ORM + 마이그레이션 라이브러리.
+PostgreSQL (비동기) · MySQL/MariaDB (클라우드) · SQLite3 · Redis (비동기) 드라이버와
+헤더 전용 ORM, 드라이버 독립 마이그레이션 프레임워크를 제공한다.
 
 ## 파일 구조
 
-- src/db/orm.hpp                — 헤더 전용 제너릭 ORM (C++23 Concepts 기반)
-- src/db/postgresql_driver.hpp — PostgreSQL 드라이버 팩토리 선언
-- src/db/postgresql_driver.cpp — libpq 비동기 구현 (PgReadAwaiter + PgFlushAwaiter)
-- src/db/sqlite3_driver.hpp    — SQLite3 드라이버 팩토리 선언
-- src/db/sqlite3_driver.cpp    — SQLite3 동기 구현 (mutex 직렬화)
-- CMakeLists.txt               — qbuem-stack FetchContent + sqlite3 amalgam + libpq ExternalProject
+- src/db/orm.hpp                    — 헤더 전용 제너릭 ORM (C++23 Concepts 기반)
+- src/db/postgresql_driver.hpp/cpp  — libpq 비동기 PostgreSQL 드라이버
+- src/db/sqlite3_driver.hpp/cpp     — SQLite3 amalgamation 드라이버 (개발·테스트)
+- src/db/mysql_driver.hpp/cpp       — libmysqlclient MySQL/MariaDB 드라이버 (클라우드 SQL)
+- src/db/redis_client.hpp/cpp       — 순수 RESP2 비동기 Redis 클라이언트
+- src/db/migration/migrator.hpp     — 헤더 전용 드라이버 독립 마이그레이션 프레임워크
+- CMakeLists.txt                    — 빌드 구성 (FetchContent + ExternalProject + find_library)
+- CLAUDE.md                         — Claude 작업 가이드
 
 ## CMake 타겟
 
 - qbuem-db::orm               — 헤더 전용 ORM (INTERFACE)
+- qbuem-db::migration         — 헤더 전용 마이그레이션 (INTERFACE)
 - qbuem-db::sqlite3_driver    — SQLite3 드라이버 (STATIC)
-- qbuem-db::postgresql_driver — PostgreSQL 드라이버 (STATIC)
+- qbuem-db::postgresql_driver — PostgreSQL 비동기 드라이버 (STATIC)
+- qbuem-db::mysql_driver      — MySQL/MariaDB 드라이버 (STATIC, 시스템 libmysqlclient 필요)
+- qbuem-db::redis_client      — Redis 비동기 클라이언트 (STATIC)
 
 ## ORM 핵심 API
+
+Dialect 설정으로 모든 드라이버 호환: PostgreSQL($N/RETURNING), MySQL(?/ON DUPLICATE KEY), SQLite(?/ON CONFLICT EXCLUDED).
 
 ```cpp
 // 등록 (startup 1회)
 orm::register_table<T>("table_name")
+    .dialect(Dialect::MySQL)    // 선택적 — 기본값 PostgreSQL
     .pk("id", &T::id)
     .col("col", &T::col);
 
 // SQL 생성
 auto& m = orm::meta<T>();
-m.sql_select_where("col")    // SELECT … WHERE col = $1
-m.sql_insert()               // INSERT INTO … VALUES (…) RETURNING *
-m.sql_update_pk()            // UPDATE … SET …=$N WHERE pk=$N+1 RETURNING *
-m.sql_delete_pk()            // DELETE … WHERE pk = $1
+m.sql_select_where("col")             // SELECT … WHERE col=$1
+m.sql_select_where_in("col", n)       // SELECT … WHERE col IN ($1,…,$n)
+m.sql_select_where_null("col")        // SELECT … WHERE col IS NULL
+m.sql_select_where_between("age")     // SELECT … WHERE age BETWEEN $1 AND $2
+m.sql_select_where_like("name")       // SELECT … WHERE name LIKE $1
+m.sql_select_where_paged("col",1,2,3) // WHERE col=$1 LIMIT $2 OFFSET $3
+m.sql_count_where("col")              // SELECT COUNT(*) … WHERE col=$1
+m.sql_count_where_in("col", n)        // SELECT COUNT(*) … WHERE col IN (…)
+m.sql_select_where2("a","b")          // WHERE a=$1 AND b=$2
+m.sql_insert()                        // INSERT … VALUES (…) [RETURNING *]
+m.sql_insert_batch(n)                 // INSERT … VALUES (…),(…),… [RETURNING *]
+m.sql_upsert_pk()                     // 방언별 자동 선택 (ON CONFLICT / ON DUPLICATE KEY)
+m.sql_update_pk()                     // UPDATE … SET … WHERE pk=$N [RETURNING *]
+m.sql_delete_pk()                     // DELETE … WHERE pk=$1
 
 // 파라미터 바인딩
-m.bind_insert(obj)   // PK 제외
-m.bind_update(obj)   // non-PK 먼저, PK 마지막
-m.bind_pk(obj)       // PK만
-m.bind_val(scalar)   // 단일 값
+m.bind_insert(obj)            // PK 제외
+m.bind_update(obj)            // non-PK 먼저, PK 마지막
+m.bind_batch(span<T>)         // 배치 INSERT용 flat 파라미터
+m.bind_pk(obj)                // PK만
+m.bind_val(v) / bind_val2(a,b) / bind_val3(a,b,c)
+m.bind_paged(where_val, limit, offset)
+m.bind_in(vector<int64_t>{1,2,3})     // IN 절용 (임의 range 지원)
 
 // 결과 읽기
 T obj = m.read_row(*row);         // 컬럼명 기반
-T obj = m.read_row_indexed(*row); // 인덱스 기반
+T obj = m.read_row_indexed(*row); // 인덱스 기반 (고성능)
 ```
 
-## PostgreSQL 드라이버 핵심 구조
+## 드라이버 DSN
 
-libpq를 비블로킹 모드로 구성하여 qbuem Reactor 이벤트 루프에 통합한다.
+- PostgreSQL: postgresql://user:pass@host:5432/db
+- SQLite3:    sqlite:///path/to/file.db  /  sqlite://:memory:
+- MySQL:      mysql://user:pass@host:3306/db[?ssl=true]
+- Redis:      redis://[:pass@]host[:port][/db]
 
-- PgFlushAwaiter: PQflush()==1 시 소켓 writable 이벤트 등록 후 yield
-- PgReadAwaiter: PQisBusy()==true 시 소켓 readable 이벤트 등록 후 yield, Reactor::post(resume)
-- PgAcquireAwaiter: 연결 풀 소진 시 yield → release() 호출 시 waiter에게 슬롯 직접 전달
-- 모든 쿼리는 resultFormat=1 (binary) 요청, std::byteswap(C++23)으로 big-endian 역직렬화
+## PostgreSQL 비동기 구조
 
-연결 풀 동작:
-  1. idle 슬롯 있음 → 즉시 반환
-  2. slots.size() < max_size → 새 PGconn 생성
-  3. 풀 소진 → PgAcquireAwaiter yield, release() 시 waiter resume
+libpq 비블로킹 모드 + qbuem Reactor 통합.
+PgFlushAwaiter: PQflush==1 시 writable 이벤트 yield.
+PgReadAwaiter: PQisBusy==true 시 readable 이벤트 yield → Reactor::post(resume).
+PgAcquireAwaiter: 풀 소진 yield → release() 시 waiter에게 슬롯 전달.
+바이너리 프로토콜(resultFormat=1), std::byteswap(C++23) big-endian 역직렬화.
 
-## SQLite3 드라이버 핵심 구조
+## Redis 비동기 구조
 
-단일 sqlite3* + std::mutex 직렬화. WAL 모드 + foreign_keys=ON 자동 설정.
-PostgreSQL 드라이버와 동일한 IConnection/ITransaction/IStatement 인터페이스 구현.
-DSN: sqlite:///path/to/file.db 또는 sqlite://:memory:
+순수 POSIX TCP + RESP2 프로토콜 구현. 외부 의존성 없음.
+RedisWriteAwaiter: non-blocking write, 미완 시 writable 이벤트 yield.
+RedisReadAwaiter: RespParser가 완성된 응답을 가질 때까지 readable 이벤트 yield.
+지원 명령: 문자열(GET/SET/SETNX/DEL/MGET/INCR 등) · 해시 · 리스트 · 셋 · 정렬셋 · 기타.
+
+## MySQL 드라이버 구조
+
+libmysqlclient C API 기반. $N → ? 플레이스홀더 자동 변환.
+다중 커넥션 풀, MYSQL_STMT prepared statement, UTF8MB4, TLS/SSL 옵션.
+클라우드 호환: RDS / Aurora / Cloud SQL / Azure DB / PlanetScale / TiDB.
+
+## 마이그레이션 프레임워크
+
+__schema_migrations 테이블에 이력 저장. 드라이버 독립(플레이스홀더 스타일 지정).
+API: migrate() / migrate_to(ver) / rollback() / rollback_to(ver) / status().
+세미콜론 구분 다중 SQL 문장 지원, 트랜잭션 내 원자 적용.
 
 ## 의존성
 
-- qbuem-stack: FetchContent (qbuem::db::IDBDriver, IConnection, IRow 인터페이스)
-- SQLite3 amalgamation 3.49.1: FetchContent ZIP 직접 컴파일
-- libpq (PostgreSQL 17.2): ExternalProject_Add 소스 빌드 (libpq only)
-
-## 지원 Value 타입
-
-OrmInt (int16/32/64, uint32), OrmFloat (double/float), OrmText (std::string),
-OrmBool (bool), OrmOptional (std::optional<OrmScalar>)
+- qbuem-stack: FetchContent GIT (인터페이스, Reactor, Task, Result)
+- SQLite3 3.49.1: FetchContent ZIP 직접 컴파일
+- libpq 17.2: ExternalProject_Add 소스 빌드 (libpq only)
+- libmysqlclient: 시스템 find_library (선택, apt install libmysqlclient-dev)
