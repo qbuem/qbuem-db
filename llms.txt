@@ -1,0 +1,76 @@
+# qbuem-db
+
+qbuem-stack 기반 C++23 DB 드라이버 + ORM 라이브러리.
+PostgreSQL (libpq 비동기) + SQLite3 (amalgamation) 드라이버와 헤더 전용 ORM을 제공한다.
+
+## 파일 구조
+
+- src/db/orm.hpp                — 헤더 전용 제너릭 ORM (C++23 Concepts 기반)
+- src/db/postgresql_driver.hpp — PostgreSQL 드라이버 팩토리 선언
+- src/db/postgresql_driver.cpp — libpq 비동기 구현 (PgReadAwaiter + PgFlushAwaiter)
+- src/db/sqlite3_driver.hpp    — SQLite3 드라이버 팩토리 선언
+- src/db/sqlite3_driver.cpp    — SQLite3 동기 구현 (mutex 직렬화)
+- CMakeLists.txt               — qbuem-stack FetchContent + sqlite3 amalgam + libpq ExternalProject
+
+## CMake 타겟
+
+- qbuem-db::orm               — 헤더 전용 ORM (INTERFACE)
+- qbuem-db::sqlite3_driver    — SQLite3 드라이버 (STATIC)
+- qbuem-db::postgresql_driver — PostgreSQL 드라이버 (STATIC)
+
+## ORM 핵심 API
+
+```cpp
+// 등록 (startup 1회)
+orm::register_table<T>("table_name")
+    .pk("id", &T::id)
+    .col("col", &T::col);
+
+// SQL 생성
+auto& m = orm::meta<T>();
+m.sql_select_where("col")    // SELECT … WHERE col = $1
+m.sql_insert()               // INSERT INTO … VALUES (…) RETURNING *
+m.sql_update_pk()            // UPDATE … SET …=$N WHERE pk=$N+1 RETURNING *
+m.sql_delete_pk()            // DELETE … WHERE pk = $1
+
+// 파라미터 바인딩
+m.bind_insert(obj)   // PK 제외
+m.bind_update(obj)   // non-PK 먼저, PK 마지막
+m.bind_pk(obj)       // PK만
+m.bind_val(scalar)   // 단일 값
+
+// 결과 읽기
+T obj = m.read_row(*row);         // 컬럼명 기반
+T obj = m.read_row_indexed(*row); // 인덱스 기반
+```
+
+## PostgreSQL 드라이버 핵심 구조
+
+libpq를 비블로킹 모드로 구성하여 qbuem Reactor 이벤트 루프에 통합한다.
+
+- PgFlushAwaiter: PQflush()==1 시 소켓 writable 이벤트 등록 후 yield
+- PgReadAwaiter: PQisBusy()==true 시 소켓 readable 이벤트 등록 후 yield, Reactor::post(resume)
+- PgAcquireAwaiter: 연결 풀 소진 시 yield → release() 호출 시 waiter에게 슬롯 직접 전달
+- 모든 쿼리는 resultFormat=1 (binary) 요청, std::byteswap(C++23)으로 big-endian 역직렬화
+
+연결 풀 동작:
+  1. idle 슬롯 있음 → 즉시 반환
+  2. slots.size() < max_size → 새 PGconn 생성
+  3. 풀 소진 → PgAcquireAwaiter yield, release() 시 waiter resume
+
+## SQLite3 드라이버 핵심 구조
+
+단일 sqlite3* + std::mutex 직렬화. WAL 모드 + foreign_keys=ON 자동 설정.
+PostgreSQL 드라이버와 동일한 IConnection/ITransaction/IStatement 인터페이스 구현.
+DSN: sqlite:///path/to/file.db 또는 sqlite://:memory:
+
+## 의존성
+
+- qbuem-stack: FetchContent (qbuem::db::IDBDriver, IConnection, IRow 인터페이스)
+- SQLite3 amalgamation 3.49.1: FetchContent ZIP 직접 컴파일
+- libpq (PostgreSQL 17.2): ExternalProject_Add 소스 빌드 (libpq only)
+
+## 지원 Value 타입
+
+OrmInt (int16/32/64, uint32), OrmFloat (double/float), OrmText (std::string),
+OrmBool (bool), OrmOptional (std::optional<OrmScalar>)
