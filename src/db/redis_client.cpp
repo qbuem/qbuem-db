@@ -89,7 +89,10 @@ static RedisDsn parse_dsn(std::string_view dsn) {
 
 static std::string encode_resp(const std::vector<std::string>& args) {
     std::string buf;
-    buf.reserve(64);
+    // *<N>\r\n  +  per arg: $<len>\r\n<data>\r\n  ≈ 16 + 8*N + sum(sizes)
+    std::size_t total = 16;
+    for (const auto& a : args) total += 8 + a.size();
+    buf.reserve(total);
     buf += '*';
     buf += std::to_string(args.size());
     buf += "\r\n";
@@ -333,6 +336,8 @@ public:
         if (!write_aw.await_ready()) {
             if (!co_await write_aw)
                 co_return unexpected(make_error(RedisError::ConnectionClosed));
+        } else if (write_aw.error) {
+            co_return unexpected(make_error(RedisError::ConnectionClosed));
         }
 
         // 읽기

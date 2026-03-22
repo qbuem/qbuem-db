@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -45,15 +46,13 @@ struct MysqlDsn {
     bool        use_ssl{false};
 };
 
-/// mysql://user:pass@host:port/dbname[?ssl=true]
 static MysqlDsn parse_dsn(std::string_view dsn) {
     MysqlDsn result;
 
-    // strip scheme
-    if (dsn.starts_with("mysql://"))  dsn.remove_prefix(8);
+    if (dsn.starts_with("mysql://"))    dsn.remove_prefix(8);
     else if (dsn.starts_with("mariadb://")) dsn.remove_prefix(10);
 
-    // ssl option
+    // ssl 옵션
     if (auto pos = dsn.find('?'); pos != std::string_view::npos) {
         auto opts = dsn.substr(pos + 1);
         dsn       = dsn.substr(0, pos);
@@ -116,48 +115,13 @@ struct CellData {
     std::string text;
 };
 
-// ─── 커넥션 생성 헬퍼 ─────────────────────────────────────────────────────────
+// ─── 컬럼 값 읽기 (text/string 표현으로부터) ──────────────────────────────────
 
-static MYSQL* create_connection(const MysqlDsn& dsn) {
-    MYSQL* conn = mysql_init(nullptr);
-    if (!conn) return nullptr;
-
-    // UTF8MB4 문자셋 설정
-    mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
-    // 재연결 허용
-    bool reconnect = true;
-    mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
-
-    if (dsn.use_ssl) {
-        mysql_options(conn, MYSQL_OPT_SSL_ENFORCE, &reconnect);
-    }
-
-    const char* pass_ptr = dsn.password.empty() ? nullptr : dsn.password.c_str();
-
-    if (!mysql_real_connect(conn,
-                            dsn.host.c_str(),
-                            dsn.user.c_str(),
-                            pass_ptr,
-                            dsn.dbname.c_str(),
-                            dsn.port,
-                            nullptr, 0)) {
-        mysql_close(conn);
-        return nullptr;
-    }
-    return conn;
-}
-
-// ─── 결과 읽기 ────────────────────────────────────────────────────────────────
-
-static CellData cell_from_field(MYSQL_ROW row, MYSQL_FIELD* field,
-                                 unsigned long len, int col) {
+static CellData cell_from_text(const char* val, unsigned long len,
+                                 MYSQL_FIELD* field) noexcept {
     CellData c;
-    if (!row[col]) {
-        c.type = Value::Type::Null;
-        return c;
-    }
+    if (!val || !field) return c; // Null
 
-    const char* val = row[col];
     switch (field->type) {
         case MYSQL_TYPE_TINY:
         case MYSQL_TYPE_SHORT:
@@ -172,15 +136,13 @@ static CellData cell_from_field(MYSQL_ROW row, MYSQL_FIELD* field,
         case MYSQL_TYPE_DECIMAL:
         case MYSQL_TYPE_NEWDECIMAL:
             c.type = Value::Type::Float64;
-            // from_chars for float is C++17, use stod for compatibility
             try { c.f64 = std::stod(std::string(val, len)); } catch (...) {}
             break;
         case MYSQL_TYPE_BIT:
             c.type = Value::Type::Int64;
-            // BIT fields come as binary
-            c.i64 = 0;
-            for (unsigned long i = 0; i < len; ++i)
-                c.i64 = (c.i64 << 8) | static_cast<uint8_t>(val[i]);
+            c.i64  = 0;
+            for (unsigned long bi = 0; bi < len; ++bi)
+                c.i64 = (c.i64 << 8) | static_cast<uint8_t>(val[bi]);
             break;
         case MYSQL_TYPE_TINY_BLOB:
         case MYSQL_TYPE_MEDIUM_BLOB:
@@ -274,11 +236,46 @@ private:
     uint64_t                                  last_id_;
 };
 
+// ─── 커넥션 생성 헬퍼 ─────────────────────────────────────────────────────────
+
+static MYSQL* create_connection(const MysqlDsn& dsn) {
+    MYSQL* conn = mysql_init(nullptr);
+    if (!conn) return nullptr;
+
+    mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    const bool reconnect_opt = true;
+    mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect_opt);
+    if (dsn.use_ssl) {
+        const bool ssl_enforce = true;
+        mysql_options(conn, MYSQL_OPT_SSL_ENFORCE, &ssl_enforce);
+    }
+
+    const char* pass_ptr = dsn.password.empty() ? nullptr : dsn.password.c_str();
+    if (!mysql_real_connect(conn,
+                            dsn.host.c_str(),
+                            dsn.user.c_str(),
+                            pass_ptr,
+                            dsn.dbname.c_str(),
+                            dsn.port,
+                            nullptr, 0)) {
+        mysql_close(conn);
+        return nullptr;
+    }
+    return conn;
+}
+
+// ─── 파라미터 바인딩 버퍼 (각 파라미터에 독립적인 숫자 버퍼 보장) ────────────
+
+struct ParamBuf {
+    int64_t i64{};
+    double  f64{};
+};
+
 // ─── 쿼리 실행 헬퍼 ──────────────────────────────────────────────────────────
+// 호출자는 반드시 해당 slot의 mutex를 보유한 상태로 호출해야 함.
 
 static Result<std::unique_ptr<IResultSet>>
 exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
-    // $N → ? 변환
     const auto converted = convert_placeholders(sql);
 
     MYSQL_STMT* stmt = mysql_stmt_init(conn);
@@ -287,17 +284,19 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
 
     if (mysql_stmt_prepare(stmt, converted.c_str(),
                            static_cast<unsigned long>(converted.size()))) {
-        unsigned int err = mysql_stmt_errno(stmt);
+        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
         return unexpected(mysql_error_code(err));
     }
 
-    // 파라미터 바인딩
-    std::vector<MYSQL_BIND> binds(params.size());
+    // 파라미터 바인딩 — 각 파라미터에 독립적인 숫자 버퍼 할당
+    std::vector<ParamBuf>    num_bufs(params.size());
+    std::vector<MYSQL_BIND>  binds(params.size());
     std::vector<std::string> str_bufs(params.size());
 
     for (std::size_t i = 0; i < params.size(); ++i) {
-        auto& b = binds[i];
+        auto& b   = binds[i];
+        auto& buf = num_bufs[i];
         const auto& v = params[i];
         std::memset(&b, 0, sizeof(b));
         switch (v.type()) {
@@ -305,29 +304,24 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
                 b.buffer_type = MYSQL_TYPE_NULL;
                 break;
             case Value::Type::Bool:
-            case Value::Type::Int64: {
-                static thread_local int64_t ibuf;
-                ibuf = v.get<int64_t>();
-                b.buffer_type = MYSQL_TYPE_LONGLONG;
-                b.buffer       = &ibuf;
+            case Value::Type::Int64:
+                buf.i64 = v.get<int64_t>();
+                b.buffer_type   = MYSQL_TYPE_LONGLONG;
+                b.buffer        = &buf.i64;
                 b.buffer_length = sizeof(int64_t);
                 break;
-            }
-            case Value::Type::Float64: {
-                static thread_local double dbuf;
-                dbuf = v.get<double>();
-                b.buffer_type = MYSQL_TYPE_DOUBLE;
-                b.buffer       = &dbuf;
+            case Value::Type::Float64:
+                buf.f64 = v.get<double>();
+                b.buffer_type   = MYSQL_TYPE_DOUBLE;
+                b.buffer        = &buf.f64;
                 b.buffer_length = sizeof(double);
                 break;
-            }
-            case Value::Type::Text: {
-                str_bufs[i] = std::string{v.get<std::string_view>()};
+            case Value::Type::Text:
+                str_bufs[i]     = std::string{v.get<std::string_view>()};
                 b.buffer_type   = MYSQL_TYPE_STRING;
                 b.buffer        = str_bufs[i].data();
                 b.buffer_length = static_cast<unsigned long>(str_bufs[i].size());
                 break;
-            }
             case Value::Type::Blob: {
                 auto bv = v.get<BufferView>();
                 str_bufs[i].assign(reinterpret_cast<const char*>(bv.data()), bv.size());
@@ -340,21 +334,20 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     }
 
     if (!params.empty() && mysql_stmt_bind_param(stmt, binds.data())) {
-        unsigned int err = mysql_stmt_errno(stmt);
+        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
         return unexpected(mysql_error_code(err));
     }
 
     if (mysql_stmt_execute(stmt)) {
-        unsigned int err = mysql_stmt_errno(stmt);
+        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
         return unexpected(mysql_error_code(err));
     }
 
-    uint64_t affected = static_cast<uint64_t>(mysql_stmt_affected_rows(stmt));
-    uint64_t last_id  = static_cast<uint64_t>(mysql_stmt_insert_id(stmt));
+    const uint64_t affected = static_cast<uint64_t>(mysql_stmt_affected_rows(stmt));
+    const uint64_t last_id  = static_cast<uint64_t>(mysql_stmt_insert_id(stmt));
 
-    // 결과 메타데이터
     MYSQL_RES* meta = mysql_stmt_result_metadata(stmt);
     if (!meta) {
         mysql_stmt_close(stmt);
@@ -364,23 +357,27 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
             affected, last_id);
     }
 
-    const unsigned int ncols = mysql_num_fields(meta);
+    const unsigned int ncols   = mysql_num_fields(meta);
+    MYSQL_FIELD*       fields  = mysql_fetch_fields(meta);
+
     auto col_names = std::make_shared<std::vector<std::string>>();
     col_names->reserve(ncols);
-    MYSQL_FIELD* fields = mysql_fetch_fields(meta);
     for (unsigned int i = 0; i < ncols; ++i)
         col_names->emplace_back(fields[i].name ? fields[i].name : "");
 
-    // 결과 바인딩
-    std::vector<MYSQL_BIND> res_binds(ncols);
-    std::vector<std::vector<char>> col_bufs(ncols);
-    std::vector<unsigned long>     col_lens(ncols, 0);
-    std::vector<my_bool>           col_nulls(ncols, 0);
+    // 결과 바인딩 (TEXT 형식으로 수신)
+    std::vector<MYSQL_BIND>         res_binds(ncols);
+    std::vector<std::vector<char>>  col_bufs(ncols);
+    std::vector<unsigned long>      col_lens(ncols, 0);
+    std::vector<my_bool>            col_nulls(ncols, 0);
 
     for (unsigned int i = 0; i < ncols; ++i) {
         auto& b = res_binds[i];
         std::memset(&b, 0, sizeof(b));
-        col_bufs[i].resize(fields[i].max_length ? fields[i].max_length + 1 : 256);
+        // max_length=0이면 적당한 초기 크기 사용, 나중에 필요 시 재할당
+        const unsigned long init_sz =
+            fields[i].max_length > 0 ? fields[i].max_length + 1 : 256;
+        col_bufs[i].resize(init_sz);
         b.buffer_type   = MYSQL_TYPE_STRING;
         b.buffer        = col_bufs[i].data();
         b.buffer_length = static_cast<unsigned long>(col_bufs[i].size());
@@ -401,65 +398,23 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     }
 
     std::vector<std::vector<CellData>> rows;
-    while (mysql_stmt_fetch(stmt) == 0) {
+    int fetch_rc;
+    while ((fetch_rc = mysql_stmt_fetch(stmt)) == 0 || fetch_rc == MYSQL_DATA_TRUNCATED) {
         std::vector<CellData> row;
         row.reserve(ncols);
         for (unsigned int i = 0; i < ncols; ++i) {
-            CellData c;
             if (col_nulls[i]) {
-                c.type = Value::Type::Null;
-            } else {
-                // Re-fetch with correct length if truncated
-                if (col_lens[i] > col_bufs[i].size()) {
-                    col_bufs[i].resize(col_lens[i] + 1);
-                    res_binds[i].buffer        = col_bufs[i].data();
-                    res_binds[i].buffer_length = col_lens[i];
-                    mysql_stmt_fetch_column(stmt, &res_binds[i], i, 0);
-                }
-                const std::string_view raw{col_bufs[i].data(), col_lens[i]};
-                c = cell_from_field(
-                    // adapt: create a temporary MYSQL_ROW-like interface
-                    [](const std::string_view sv, MYSQL_FIELD* f, unsigned long l,
-                       int /*col*/) -> CellData {
-                        CellData cd;
-                        switch (f->type) {
-                            case MYSQL_TYPE_TINY:
-                            case MYSQL_TYPE_SHORT:
-                            case MYSQL_TYPE_INT24:
-                            case MYSQL_TYPE_LONG:
-                            case MYSQL_TYPE_LONGLONG:
-                                cd.type = Value::Type::Int64;
-                                std::from_chars(sv.data(), sv.data() + l, cd.i64);
-                                break;
-                            case MYSQL_TYPE_FLOAT:
-                            case MYSQL_TYPE_DOUBLE:
-                            case MYSQL_TYPE_DECIMAL:
-                            case MYSQL_TYPE_NEWDECIMAL:
-                                cd.type = Value::Type::Float64;
-                                try { cd.f64 = std::stod(std::string(sv.data(), l)); }
-                                catch (...) {}
-                                break;
-                            case MYSQL_TYPE_TINY_BLOB:
-                            case MYSQL_TYPE_MEDIUM_BLOB:
-                            case MYSQL_TYPE_LONG_BLOB:
-                            case MYSQL_TYPE_BLOB:
-                                if (f->flags & BINARY_FLAG) {
-                                    cd.type = Value::Type::Blob;
-                                    cd.text.assign(sv.data(), l);
-                                } else {
-                                    cd.type = Value::Type::Text;
-                                    cd.text.assign(sv.data(), l);
-                                }
-                                break;
-                            default:
-                                cd.type = Value::Type::Text;
-                                cd.text.assign(sv.data(), l);
-                                break;
-                        }
-                        return cd;
-                    }(raw, &fields[i], col_lens[i], static_cast<int>(i)));
+                row.push_back(CellData{});
+                continue;
             }
-            row.push_back(std::move(c));
+            // 데이터가 잘렸으면 정확한 크기로 재할당 후 재fetch
+            if (fetch_rc == MYSQL_DATA_TRUNCATED || col_lens[i] > col_bufs[i].size()) {
+                col_bufs[i].resize(col_lens[i] + 1);
+                res_binds[i].buffer        = col_bufs[i].data();
+                res_binds[i].buffer_length = col_lens[i];
+                mysql_stmt_fetch_column(stmt, &res_binds[i], i, 0);
+            }
+            row.push_back(cell_from_text(col_bufs[i].data(), col_lens[i], &fields[i]));
         }
         rows.push_back(std::move(row));
     }
@@ -469,6 +424,10 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     return std::make_unique<MysqlResultSet>(
         std::move(rows), std::move(col_names), affected, last_id);
 }
+
+// ─── 전방 선언 ────────────────────────────────────────────────────────────────
+
+class MysqlConnectionPool;
 
 // ─── Statement ────────────────────────────────────────────────────────────────
 
@@ -518,7 +477,6 @@ public:
         std::lock_guard lock{mx_};
         co_return exec_sql("ROLLBACK TO SAVEPOINT " + std::string(name));
     }
-
     Task<Result<uint64_t>>
     execute(std::string_view sql, std::span<const Value> params) override {
         std::lock_guard lock{mx_};
@@ -542,7 +500,11 @@ private:
 
 class MysqlConnection final : public IConnection {
 public:
-    MysqlConnection(MYSQL* db, std::mutex& mx) : db_(db), mx_(mx) {}
+    MysqlConnection(MYSQL* db, std::mutex& mx, size_t slot_idx,
+                    MysqlConnectionPool* pool)
+        : db_(db), mx_(mx), slot_idx_(slot_idx), pool_(pool) {}
+
+    ~MysqlConnection() override;  // 정의는 아래 (MysqlConnectionPool 완전 정의 후)
 
     ConnectionState state() const noexcept override { return state_; }
 
@@ -566,8 +528,9 @@ public:
         const auto li = static_cast<uint8_t>(level);
         {
             std::lock_guard lock{mx_};
-            const std::string set_sql = std::string("SET TRANSACTION ISOLATION LEVEL ")
-                                      + std::string(kLevel[li < 4 ? li : 1]);
+            const std::string set_sql =
+                std::string("SET TRANSACTION ISOLATION LEVEL ")
+                + std::string(kLevel[li < 4 ? li : 1]);
             mysql_query(db_, set_sql.c_str());
             if (mysql_query(db_, "START TRANSACTION"))
                 co_return unexpected(mysql_error_code(mysql_errno(db_)));
@@ -587,22 +550,34 @@ public:
     }
 
 private:
-    MYSQL*          db_;
-    std::mutex&     mx_;
-    ConnectionState state_{ConnectionState::Idle};
+    MYSQL*               db_;
+    std::mutex&          mx_;
+    size_t               slot_idx_;
+    MysqlConnectionPool* pool_;
+    ConnectionState      state_{ConnectionState::Idle};
 };
 
-// ─── Slot (커넥션 슬롯) ───────────────────────────────────────────────────────
+// ─── Slot ─────────────────────────────────────────────────────────────────────
 
 struct MysqlSlot {
-    MYSQL*     conn{nullptr};
-    std::mutex mutex;
+    using Clock = std::chrono::steady_clock;
+
+    MYSQL*             conn{nullptr};
+    std::mutex         mutex;
+    Clock::time_point  idle_since{Clock::now()};
 
     explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
     ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
 
     MysqlSlot(const MysqlSlot&)            = delete;
     MysqlSlot& operator=(const MysqlSlot&) = delete;
+
+    void mark_idle() noexcept { idle_since = Clock::now(); }
+
+    bool needs_liveness_check() const noexcept {
+        // 30초 이상 idle 상태였던 연결만 ping 확인
+        return (Clock::now() - idle_since) > std::chrono::seconds{30};
+    }
 };
 
 // ─── ConnectionPool ───────────────────────────────────────────────────────────
@@ -624,7 +599,7 @@ public:
 
     ~MysqlConnectionPool() override = default;
 
-    bool is_valid() const noexcept { return !slots_.empty(); }
+    [[nodiscard]] bool is_valid() const noexcept { return !slots_.empty(); }
 
     Task<Result<std::unique_ptr<IConnection>>> acquire() override {
         std::unique_lock lock{mutex_};
@@ -633,10 +608,10 @@ public:
         if (!idle_.empty()) {
             const size_t idx = idle_.front(); idle_.pop();
             lock.unlock();
+
             auto* slot = slots_[idx].get();
-            // 연결 유효성 확인 (ping)
-            if (mysql_ping(slot->conn) != 0) {
-                // 재연결 시도
+            // 30초 이상 놀았던 연결만 ping으로 확인 (매번 ping 방지)
+            if (slot->needs_liveness_check() && mysql_ping(slot->conn) != 0) {
                 MYSQL* fresh = create_connection(dsn_);
                 if (!fresh) {
                     lock.lock(); idle_.push(idx);
@@ -646,32 +621,44 @@ public:
                 slot->conn = fresh;
             }
             active_.fetch_add(1, std::memory_order_relaxed);
-            co_return std::make_unique<MysqlConnection>(slot->conn, slot->mutex);
+            co_return std::make_unique<MysqlConnection>(
+                slot->conn, slot->mutex, idx, this);
         }
 
-        // 2. 새 슬롯
+        // 2. 새 슬롯 생성
         if (slots_.size() < max_size_) {
-            lock.unlock();
-            MYSQL* c = create_connection(dsn_);
-            if (!c) co_return unexpected(mysql_error_code(2003));
-            lock.lock();
             const size_t idx = slots_.size();
-            slots_.push_back(std::make_unique<MysqlSlot>(c));
+            slots_.push_back(nullptr); // 자리 예약
+            lock.unlock();
+
+            MYSQL* c = create_connection(dsn_);
+            if (!c) {
+                lock.lock(); slots_.pop_back();
+                co_return unexpected(mysql_error_code(2003));
+            }
+            auto slot = std::make_unique<MysqlSlot>(c);
+            MysqlSlot* raw_slot = slot.get();
+            lock.lock();
+            slots_[idx] = std::move(slot);
             lock.unlock();
             active_.fetch_add(1, std::memory_order_relaxed);
             co_return std::make_unique<MysqlConnection>(
-                slots_[idx]->conn, slots_[idx]->mutex);
+                raw_slot->conn, raw_slot->mutex, idx, this);
         }
 
-        // 3. 풀 소진 — 즉시 에러 반환 (MySQL은 동기 드라이버)
+        // 3. 풀 소진 → 즉시 에러 (동기 드라이버)
         co_return unexpected(mysql_error_code(2003)); // CR_CONN_HOST_ERROR
     }
 
-    void return_connection(std::unique_ptr<IConnection>) noexcept override {
-        // 슬롯을 직접 관리하지 않으므로 idle로 돌려보내지 않음
-        // (단순화: 각 IConnection은 슬롯 인덱스를 보유하지 않음)
+    void release(size_t idx) noexcept {
         active_.fetch_sub(1, std::memory_order_relaxed);
+        slots_[idx]->mark_idle();
+        std::lock_guard lock{mutex_};
+        idle_.push(idx);
     }
+
+    // return_connection은 unique_ptr 소멸 → ~MysqlConnection → release() 경로로 처리
+    void return_connection(std::unique_ptr<IConnection>) noexcept override {}
 
     size_t active_count() const noexcept override {
         return active_.load(std::memory_order_relaxed);
@@ -698,11 +685,17 @@ private:
     std::atomic<size_t>                       active_{0};
 };
 
+// ─── MysqlConnection::~MysqlConnection 구현 ──────────────────────────────────
+
+MysqlConnection::~MysqlConnection() {
+    if (pool_) pool_->release(slot_idx_);
+}
+
 // ─── Driver ───────────────────────────────────────────────────────────────────
 
 class MysqlDriver final : public IDBDriver {
 public:
-    MysqlDriver() { mysql_library_init(0, nullptr, nullptr); }
+    MysqlDriver()  { mysql_library_init(0, nullptr, nullptr); }
     ~MysqlDriver() override { mysql_library_end(); }
 
     std::string_view driver_name() const noexcept override { return "mysql"; }

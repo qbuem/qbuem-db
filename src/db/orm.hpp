@@ -140,6 +140,7 @@ public:
     template<OrmField F>
     TableMeta& col(std::string col_name, F T::* ptr) {
         fields_.push_back(make_field<F>(std::move(col_name), ptr, false));
+        ++non_pk_count_;
         return *this;
     }
 
@@ -270,7 +271,7 @@ public:
     /// @param n  삽입할 행 수
     [[nodiscard]] std::string sql_insert_batch(std::size_t n, bool returning = true) const {
         const auto cols    = col_list_no_pk();
-        const auto nfields = non_pk_count();
+        const auto nfields = non_pk_count_;
         std::string values_clause;
         for (std::size_t row = 0; row < n; ++row) {
             if (row > 0) values_clause += ", ";
@@ -376,7 +377,7 @@ public:
     /// 배치 INSERT용: 여러 객체를 flat하게 바인딩 (non-PK 필드만, 행 단위로 순서)
     [[nodiscard]] std::vector<Value> bind_batch(std::span<const T> objects) const {
         std::vector<Value> params;
-        params.reserve(objects.size() * non_pk_count());
+        params.reserve(objects.size() * non_pk_count_);
         for (const auto& obj : objects) {
             for (const auto& f : fields_) {
                 if (!f.is_pk) params.push_back(f.to_val(obj));
@@ -446,16 +447,12 @@ public:
     }
 
 private:
-    std::string            table_;
-    std::string            pk_;
+    std::string              table_;
+    std::string              pk_;
     std::vector<FieldDef<T>> fields_;
+    std::size_t              non_pk_count_{0};
 
     // ── 내부 SQL 조각 생성 ───────────────────────────────────────────────────
-
-    [[nodiscard]] std::size_t non_pk_count() const noexcept {
-        return static_cast<std::size_t>(
-            std::ranges::count_if(fields_, [](const auto& f){ return !f.is_pk; }));
-    }
 
     [[nodiscard]] std::string col_list_all() const {
         std::string r;

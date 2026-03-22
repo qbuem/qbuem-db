@@ -74,6 +74,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace qbuem_routine::migration {
@@ -268,12 +269,13 @@ public:
         auto init_r = co_await init();
         if (!init_r) co_return unexpected(init_r.error());
 
+        auto applied_set_r = co_await load_applied_set();
+        if (!applied_set_r) co_return unexpected(applied_set_r.error());
+        const auto& applied_set = *applied_set_r;
+
         MigrationResult result;
         for (const auto& m : migrations_) {
-            auto applied = co_await is_applied(m.version);
-            if (!applied) co_return unexpected(applied.error());
-
-            if (*applied) {
+            if (applied_set.contains(m.version)) {
                 ++result.skipped;
                 result.latest = m.version;
                 continue;
@@ -292,12 +294,18 @@ public:
         auto init_r = co_await init();
         if (!init_r) co_return unexpected(init_r.error());
 
+        auto applied_set_r = co_await load_applied_set();
+        if (!applied_set_r) co_return unexpected(applied_set_r.error());
+        const auto& applied_set = *applied_set_r;
+
         MigrationResult result;
         for (const auto& m : migrations_) {
             if (m.version > target_version) break;
-            auto applied = co_await is_applied(m.version);
-            if (!applied) co_return unexpected(applied.error());
-            if (*applied) { ++result.skipped; result.latest = m.version; continue; }
+            if (applied_set.contains(m.version)) {
+                ++result.skipped;
+                result.latest = m.version;
+                continue;
+            }
             auto r = co_await apply_one(m);
             if (!r) co_return unexpected(r.error());
             ++result.applied;
@@ -340,6 +348,22 @@ private:
     std::vector<Migration> migrations_;
     IConnection&           conn_;
     PlaceholderStyle       style_;
+
+    // ── 적용된 버전 일괄 로드 (N+1 쿼리 방지) ────────────────────────────────
+
+    Task<Result<std::unordered_set<uint64_t>>> load_applied_set() {
+        const std::string sql =
+            "SELECT version FROM __schema_migrations";
+        auto r = co_await conn_.query(sql, {});
+        if (!r) co_return unexpected(r.error());
+
+        std::unordered_set<uint64_t> applied;
+        while (auto* row = co_await (*r)->next()) {
+            applied.insert(
+                static_cast<uint64_t>(row->get(uint16_t{0}).get<int64_t>()));
+        }
+        co_return applied;
+    }
 
     // ── 플레이스홀더 ─────────────────────────────────────────────────────────
 
