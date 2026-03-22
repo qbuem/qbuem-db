@@ -51,7 +51,26 @@ target_link_libraries(your_target PRIVATE
 
 ## ORM (`src/db/orm.hpp`)
 
-C++23 Concepts 기반 헤더 전용 ORM.
+C++23 Concepts 기반 헤더 전용 ORM. **모든 드라이버 호환** — Dialect 설정으로 플레이스홀더·RETURNING·UPSERT 구문을 자동 조정.
+
+### Dialect 설정 (드라이버 호환)
+
+| Dialect | 플레이스홀더 | RETURNING | UPSERT |
+|---------|------------|-----------|--------|
+| `Dialect::PostgreSQL` (기본) | `$1, $2, …` | 포함 | `ON CONFLICT … EXCLUDED` |
+| `Dialect::MySQL` | `?` | 제외 | `ON DUPLICATE KEY UPDATE VALUES(col)` |
+| `Dialect::SQLite` | `?` | 제외 | `ON CONFLICT … EXCLUDED` |
+
+```cpp
+// MySQL/SQLite 사용 시 dialect 지정
+orm::register_table<User>("users")
+    .dialect(Dialect::MySQL)   // 또는 Dialect::SQLite
+    .pk("id",    &User::id)
+    .col("email", &User::email)
+    .col("name",  &User::name);
+// → sql_insert() = "INSERT INTO users(email,name) VALUES (?,?)"  (RETURNING 없음)
+// → sql_upsert_pk() = "INSERT … ON DUPLICATE KEY UPDATE email=VALUES(email),…"
+```
 
 ### 지원 필드 타입
 
@@ -63,51 +82,39 @@ C++23 Concepts 기반 헤더 전용 ORM.
 | `bool` | BOOLEAN | `OrmBool` |
 | `std::optional<T>` | NULL 허용 | `OrmOptional` |
 
-### 등록 및 기본 사용
-
-```cpp
-#include "db/orm.hpp"
-
-struct User {
-    int64_t     id;
-    std::string email;
-    std::string name;
-    std::optional<std::string> bio;
-};
-
-// 앱 시작 시 1회 등록
-orm::register_table<User>("users")
-    .pk("id",    &User::id)
-    .col("email", &User::email)
-    .col("name",  &User::name)
-    .col("bio",   &User::bio);
-```
-
 ### SQL 생성 메서드 전체
 
-| 메서드 | 생성 SQL |
-|--------|---------|
+> 아래 SQL 예시는 `Dialect::PostgreSQL` 기준. MySQL/SQLite는 `$N` → `?` 자동 변환.
+
+| 메서드 | 생성 SQL (PostgreSQL) |
+|--------|-----------------------|
 | `sql_select_all()` | `SELECT id,… FROM users` |
 | `sql_select_where("email")` | `SELECT … WHERE email=$1` |
 | `sql_select_ordered("email","id")` | `SELECT … WHERE email=$1 ORDER BY id ASC` |
 | `sql_select_all_ordered("id", Desc)` | `SELECT … ORDER BY id DESC` |
 | `sql_select_raw_where("id > 100")` | `SELECT … WHERE id > 100` |
+| `sql_select_where_in("id", 3)` | `SELECT … WHERE id IN ($1,$2,$3)` |
+| `sql_select_where_null("bio")` | `SELECT … WHERE bio IS NULL` |
+| `sql_select_where_not_null("bio")` | `SELECT … WHERE bio IS NOT NULL` |
+| `sql_select_where_between("age")` | `SELECT … WHERE age BETWEEN $1 AND $2` |
+| `sql_select_where_like("name")` | `SELECT … WHERE name LIKE $1` |
 | `sql_select_paged()` | `SELECT … LIMIT $1 OFFSET $2` |
 | `sql_select_where_paged("email")` | `SELECT … WHERE email=$1 LIMIT $2 OFFSET $3` |
 | `sql_select_all_ordered_paged("id")` | `SELECT … ORDER BY id ASC LIMIT $1 OFFSET $2` |
 | `sql_count()` | `SELECT COUNT(*) FROM users` |
-| `sql_count_where("email")` | `SELECT COUNT(*) FROM users WHERE email=$1` |
-| `sql_count_raw_where("id > 100")` | `SELECT COUNT(*) FROM users WHERE id > 100` |
+| `sql_count_where("email")` | `SELECT COUNT(*) … WHERE email=$1` |
+| `sql_count_raw_where("id > 100")` | `SELECT COUNT(*) … WHERE id > 100` |
+| `sql_count_where_in("id", 3)` | `SELECT COUNT(*) … WHERE id IN ($1,$2,$3)` |
 | `sql_select_where2("email","name")` | `SELECT … WHERE email=$1 AND name=$2` |
 | `sql_select_where3("a","b","c")` | `SELECT … WHERE a=$1 AND b=$2 AND c=$3` |
 | `sql_insert()` | `INSERT INTO users(email,name,bio) VALUES ($1,$2,$3) RETURNING *` |
 | `sql_insert_batch(3)` | `INSERT … VALUES ($1,$2,$3),($4,$5,$6),($7,$8,$9) RETURNING *` |
-| `sql_upsert_pk()` | `INSERT … ON CONFLICT (id) DO UPDATE SET email=EXCLUDED.email,… RETURNING *` |
-| `sql_update_pk()` | `UPDATE users SET email=$1,name=$2,bio=$3 WHERE id=$4 RETURNING *` |
+| `sql_upsert_pk()` | `INSERT … ON CONFLICT (id) DO UPDATE SET … RETURNING *` |
+| `sql_update_pk()` | `UPDATE users SET email=$1,… WHERE id=$N RETURNING *` |
 | `sql_update_col_pk("name")` | `UPDATE users SET name=$1 WHERE id=$2 RETURNING *` |
 | `sql_delete_pk()` | `DELETE FROM users WHERE id=$1` |
 | `sql_delete_where("email")` | `DELETE FROM users WHERE email=$1` |
-| `sql_delete_where2("email","name")` | `DELETE FROM users WHERE email=$1 AND name=$2` |
+| `sql_delete_where2("email","name")` | `DELETE … WHERE email=$1 AND name=$2` |
 
 ### 파라미터 바인딩
 
@@ -130,15 +137,40 @@ auto params = m.bind_val3(a, b, c);              // 3개
 
 // WHERE + LIMIT + OFFSET (페이지네이션)
 auto params = m.bind_paged(email, 20, 0);        // email=$1, limit=20, offset=0
+
+// IN 절용: 임의 범위 (vector, span, initializer_list 등)
+std::vector<int64_t> ids = {1, 2, 3};
+auto params = m.bind_in(ids);                    // [1, 2, 3]
+auto params = m.bind_in(std::vector<std::string>{"a@b.com", "c@d.com"});
 ```
 
 ### 결과 읽기
 
 ```cpp
 while (auto* row = co_await rs->next()) {
-    User u = m.read_row(*row);        // 컬럼명 기반 (안전)
+    User u = m.read_row(*row);         // 컬럼명 기반 (안전)
     User u = m.read_row_indexed(*row); // 인덱스 기반 (고성능)
 }
+```
+
+### 전체 드라이버 사용 예시
+
+```cpp
+// PostgreSQL (기본 — RETURNING으로 삽입된 행 즉시 수신)
+auto& m = orm::meta<User>();
+auto rs = co_await conn->query(m.sql_insert(), m.bind_insert(user));
+User inserted = m.read_row(*co_await (*rs)->next());
+
+// MySQL (RETURNING 없음 — last_insert_id로 PK 획득)
+auto& m = orm::meta<User>();  // dialect(Dialect::MySQL) 등록됨
+auto rs = co_await conn->query(m.sql_insert(), m.bind_insert(user));
+user.id = static_cast<int64_t>((*rs)->last_insert_id());
+
+// IN 쿼리 (모든 드라이버 동일)
+std::vector<int64_t> ids = {10, 20, 30};
+auto sql    = m.sql_select_where_in("id", ids.size());
+auto params = m.bind_in(ids);
+auto rs2    = co_await conn->query(sql, params);
 ```
 
 ---

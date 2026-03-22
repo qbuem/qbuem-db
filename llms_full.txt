@@ -10,9 +10,14 @@ C++23 기반 DB 드라이버 라이브러리. qbuem-stack 위에서 동작.
 
 ---
 
-## src/db/orm.hpp — 헤더 전용 ORM
+## src/db/orm.hpp — 헤더 전용 ORM (드라이버 독립)
 
 C++23 Concepts 기반. TableMeta<T>에 SQL 생성 + 바인딩 + 읽기 메서드.
+Dialect 설정으로 모든 드라이버 호환.
+
+### Dialect
+enum class Dialect { PostgreSQL(기본/$N/RETURNING), MySQL(?/RETURNING없음/ON DUPLICATE KEY), SQLite(?/RETURNING없음/ON CONFLICT EXCLUDED) }
+TableMeta<T>& dialect(Dialect d)  — 빌더에서 설정
 
 ### 지원 타입 Concepts
 - OrmInt:      int16_t / int32_t / int64_t / uint32_t
@@ -23,22 +28,28 @@ C++23 Concepts 기반. TableMeta<T>에 SQL 생성 + 바인딩 + 읽기 메서드
 
 ### TableMeta<T> SQL 생성 메서드 (전체)
 sql_select_all()                                    SELECT col1,… FROM table
-sql_select_where(col, p=1)                          SELECT … WHERE col=$p
+sql_select_where(col, p=1)                          SELECT … WHERE col=$p / ?
 sql_select_ordered(col, order_col, p, sort)         WHERE col=$p ORDER BY order_col [ASC|DESC]
 sql_select_all_ordered(order_col, sort)             ORDER BY order_col [ASC|DESC]
 sql_select_raw_where(raw_where)                     WHERE <raw_where>
+sql_select_where_in(col, n, start_p=1)             WHERE col IN ($1,…,$n) / (?,…,?)
+sql_select_where_null(col)                          WHERE col IS NULL
+sql_select_where_not_null(col)                      WHERE col IS NOT NULL
+sql_select_where_between(col, p1=1, p2=2)          WHERE col BETWEEN $1 AND $2 / ? AND ?
+sql_select_where_like(col, p=1)                     WHERE col LIKE $1 / ?
 sql_select_paged(limit_p=1, offset_p=2)            LIMIT $l OFFSET $o
 sql_select_where_paged(col, wp=1, lp=2, op=3)      WHERE col=$1 LIMIT $2 OFFSET $3
 sql_select_all_ordered_paged(order_col, sort, l, o) ORDER BY … LIMIT $l OFFSET $o
 sql_count()                                         SELECT COUNT(*) FROM table
 sql_count_where(col, p=1)                           SELECT COUNT(*) … WHERE col=$p
 sql_count_raw_where(raw_where)                      SELECT COUNT(*) … WHERE raw
+sql_count_where_in(col, n, start_p=1)              SELECT COUNT(*) … WHERE col IN (…)
 sql_select_where2(c1, c2, p1=1, p2=2)              WHERE c1=$1 AND c2=$2
 sql_select_where3(c1, c2, c3)                       WHERE c1=$1 AND c2=$2 AND c3=$3
 sql_select_where_multi(span<string_view>)           WHERE c1=$1 AND c2=$2 AND …
 sql_insert(returning=true)                          INSERT INTO … VALUES (…) [RETURNING *]
 sql_insert_batch(n, returning=true)                 INSERT … VALUES (…),(…),… [RETURNING *]
-sql_upsert_pk(returning=true)                       INSERT … ON CONFLICT(pk) DO UPDATE SET …
+sql_upsert_pk(returning=true)                       PG/SQLite: ON CONFLICT EXCLUDED / MySQL: ON DUPLICATE KEY VALUES
 sql_update_pk(returning=true)                       UPDATE … SET … WHERE pk=$N [RETURNING *]
 sql_update_col_pk(col, returning=true)              UPDATE … SET col=$1 WHERE pk=$2
 sql_delete_pk()                                     DELETE … WHERE pk=$1
@@ -54,6 +65,7 @@ bind_val(v)                     → vector<Value>  단일 값
 bind_val2(v1, v2)               → vector<Value>  2개
 bind_val3(v1, v2, v3)           → vector<Value>  3개
 bind_paged(where_val, lim, off) → vector<Value>  WHERE+LIMIT+OFFSET
+bind_in(range<OrmScalar>)       → vector<Value>  IN 절용 (vector/span/init-list)
 
 ### 전역 함수
 orm::register_table<T>(name) → TableMeta<T>&   등록 + 빌더 반환

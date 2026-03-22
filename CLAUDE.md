@@ -51,27 +51,43 @@ Awaiter 작성 규칙:
 
 ## ORM 사용 패턴
 
+Dialect 설정 필수: MySQL/SQLite는 반드시 `.dialect()` 지정. 미지정 시 PostgreSQL 기본값.
+
 ```cpp
 // 1. 등록 (app startup, 1회)
+// PostgreSQL (기본)
 orm::register_table<User>("users")
+    .pk("id", &User::id)
+    .col("email", &User::email)
+    .col("name", &User::name);
+
+// MySQL / SQLite
+orm::register_table<User>("users")
+    .dialect(Dialect::MySQL)     // 또는 Dialect::SQLite
     .pk("id", &User::id)
     .col("email", &User::email)
     .col("name", &User::name);
 
 // 2. SQL 생성
 auto& m = orm::meta<User>();
-m.sql_insert()                                  // INSERT INTO users(email,name) VALUES ($1,$2) RETURNING *
-m.sql_select_where("email")                     // SELECT ... WHERE email=$1
-m.sql_select_where_paged("email", 1, 2, 3)     // SELECT ... WHERE email=$1 LIMIT $2 OFFSET $3
+m.sql_insert()                                  // PG: VALUES ($1,$2) RETURNING * / MySQL: VALUES (?,?)
+m.sql_select_where("email")                     // WHERE email=$1 / ?
+m.sql_select_where_in("id", ids.size())         // WHERE id IN ($1,$2,$3) / (?,?,?)
+m.sql_select_where_null("bio")                  // WHERE bio IS NULL
+m.sql_select_where_between("age")               // WHERE age BETWEEN $1 AND $2
+m.sql_select_where_like("name")                 // WHERE name LIKE $1
+m.sql_select_where_paged("email", 1, 2, 3)     // WHERE email=$1 LIMIT $2 OFFSET $3
 m.sql_count_where("email")                      // SELECT COUNT(*) FROM users WHERE email=$1
-m.sql_upsert_pk()                               // INSERT ... ON CONFLICT(id) DO UPDATE SET ...
-m.sql_insert_batch(3)                           // INSERT ... VALUES ($1,$2),($3,$4),($5,$6)
+m.sql_count_where_in("id", n)                   // SELECT COUNT(*) WHERE id IN (…)
+m.sql_upsert_pk()                               // PG/SQLite: ON CONFLICT EXCLUDED / MySQL: ON DUPLICATE KEY
+m.sql_insert_batch(3)                           // INSERT VALUES ($1,…),($4,…),($7,…)
 
 // 3. 바인딩
 auto params = m.bind_insert(user);              // non-PK 값
 auto params = m.bind_update(user);              // non-PK + PK (마지막)
 auto params = m.bind_batch({u1, u2, u3});       // 배치 INSERT 파라미터
 auto params = m.bind_paged(email, 20, 0);       // WHERE + LIMIT + OFFSET
+auto params = m.bind_in(std::vector<int64_t>{1,2,3}); // IN 절 (임의 range)
 
 // 4. 결과 읽기
 User u = m.read_row(*row);                      // 컬럼명 기반
@@ -153,4 +169,9 @@ cmake --build build
   `co_await` (flush, read) 는 **락 밖에서** 수행
 - SQLite3는 FULLMUTEX 모드이므로 이중 잠금 주의
 - ORM `bind_batch()` 는 `sql_insert_batch(n)` 과 **n이 일치**해야 함
-- `sql_insert_batch()` RETURNING은 PostgreSQL 전용 — MySQL/SQLite에서는 `returning=false`
+- **ORM Dialect 미설정**: MySQL/SQLite에서 `.dialect()` 없이 쓰면 `$N` 플레이스홀더와
+  `RETURNING *`가 생성되어 런타임 SQL 오류 발생
+- **`sql_upsert_pk()` MySQL**: `ON CONFLICT` 대신 `ON DUPLICATE KEY UPDATE` 자동 생성됨 —
+  Dialect가 올바르게 설정되어 있어야 함
+- **`bind_in(ids)`**: `ids`가 비어 있으면 `WHERE col IN ()` 이 되어 SQL 오류 발생 — 호출 전 empty 체크 필요
+- **`sql_insert_batch(n)`**: n=0 또는 non-PK 컬럼이 없는 테이블에서 assert 실패

@@ -17,6 +17,24 @@ using namespace qbuem::db;
 namespace qbuem_routine {
 namespace {
 
+// ─── $N → ? 플레이스홀더 변환 (ORM 호환) ─────────────────────────────────────
+
+static std::string convert_placeholders(std::string_view sql) {
+    std::string result;
+    result.reserve(sql.size());
+    std::size_t i = 0;
+    while (i < sql.size()) {
+        if (sql[i] == '$' && i + 1 < sql.size() && std::isdigit(sql[i + 1])) {
+            result += '?';
+            ++i;
+            while (i < sql.size() && std::isdigit(sql[i])) ++i;
+        } else {
+            result += sql[i++];
+        }
+    }
+    return result;
+}
+
 // ─── CellData — 단일 컬럼 값 저장 ───────────────────────────────────────────
 
 struct CellData {
@@ -270,9 +288,10 @@ public:
     Task<Result<uint64_t>>
     execute(std::string_view sql, std::span<const Value> params) override {
         std::lock_guard lock{mx_};
+        const auto converted = convert_placeholders(sql);
         sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db_, sql.data(),
-                                    static_cast<int>(sql.size()), &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db_, converted.c_str(),
+                                    static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
             co_return unexpected(std::error_code(rc, std::generic_category()));
 
@@ -317,9 +336,10 @@ public:
     Task<Result<std::unique_ptr<IStatement>>>
     prepare(std::string_view sql) override {
         std::lock_guard lock{mx_};
+        const auto converted = convert_placeholders(sql);
         sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db_, sql.data(),
-                                    static_cast<int>(sql.size()), &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db_, converted.c_str(),
+                                    static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
             co_return unexpected(std::error_code(rc, std::generic_category()));
         co_return std::make_unique<SqliteStatement>(db_, stmt, mx_);
@@ -328,9 +348,10 @@ public:
     Task<Result<std::unique_ptr<IResultSet>>>
     query(std::string_view sql, std::span<const Value> params) override {
         std::lock_guard lock{mx_};
+        const auto converted = convert_placeholders(sql);
         sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db_, sql.data(),
-                                    static_cast<int>(sql.size()), &stmt, nullptr);
+        int rc = sqlite3_prepare_v2(db_, converted.c_str(),
+                                    static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
             co_return unexpected(std::error_code(rc, std::generic_category()));
         auto result = run_stmt(db_, stmt, params);
