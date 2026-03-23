@@ -1,113 +1,136 @@
-# qbuem-db — Claude 작업 가이드
+# CLAUDE.md — qbuem-db AI Context
 
-## 프로젝트 개요
+This file provides structured context for AI coding assistants working in this repository.
 
-C++23 기반 DB 드라이버 라이브러리. qbuem-stack 위에서 동작하며
-비동기 ORM + 여러 DB 드라이버 + 마이그레이션 툴을 제공합니다.
+---
 
-## 코드 구조
+## Language Policy
+
+**All code, comments, documentation, and user-facing strings MUST be written in English.**
+
+Korean or other non-English text in code comments, docs, or strings is a review failure.
+Existing Korean comments in legacy files should be translated to English when touched.
+
+---
+
+## Project Overview
+
+C++23 DB driver library built on qbuem-stack.
+Async ORM + multiple DB drivers + migration framework.
+
+## Code Structure
 
 ```
 src/db/
-├── orm.hpp                  # 헤더 전용 ORM (Concepts 기반)
-├── postgresql_driver.hpp/cpp  # 비동기 PostgreSQL (libpq)
-├── sqlite3_driver.hpp/cpp     # SQLite3 (테스트/개발용)
-├── mysql_driver.hpp/cpp       # MySQL/MariaDB (클라우드 SQL)
-├── redis_client.hpp/cpp       # 비동기 Redis (RESP2, 외부 의존성 없음)
+├── orm.hpp                    # Header-only ORM (C++23 Concepts-based)
+├── postgresql_driver.hpp/cpp  # Async PostgreSQL (libpq)
+├── sqlite3_driver.hpp/cpp     # SQLite3 (development / test)
+├── mysql_driver.hpp/cpp       # MySQL/MariaDB (cloud SQL)
+├── redis_client.hpp/cpp       # Async Redis (RESP2, no external deps)
 └── migration/
-    └── migrator.hpp           # 드라이버 독립 마이그레이션 프레임워크
+    └── migrator.hpp           # Driver-independent migration framework
 ```
 
-## 핵심 인터페이스 (qbuem-stack 제공)
+---
 
-- `IDBDriver`      — 드라이버 팩토리 (`pool()`)
-- `IConnectionPool`— 연결 풀 (`acquire()`, `return_connection()`)
-- `IConnection`    — 연결 (`query()`, `prepare()`, `begin()`, `ping()`)
-- `ITransaction`   — 트랜잭션 (`commit()`, `rollback()`, `savepoint()`)
-- `IStatement`     — Prepared statement (`execute()`, `execute_dml()`)
-- `IResultSet`     — 결과 반복자 (`next()`)
-- `IRow`           — 행 접근 (`get(idx)`, `get(name)`)
-- `Value`          — Null/Int64/Float64/Bool/Text/Blob 타입
-- `Result<T>`      — 에러 반환 (`qbuem::unexpected()`)
-- `Task<T>`        — 코루틴 반환 타입
+## Core Interfaces (provided by qbuem-stack)
 
-## 비동기 패턴 (PostgreSQL / Redis)
+- `IDBDriver`       — driver factory (`pool()`)
+- `IConnectionPool` — connection pool (`acquire()`, `return_connection()`)
+- `IConnection`     — connection (`query()`, `prepare()`, `begin()`, `ping()`)
+- `ITransaction`    — transaction (`commit()`, `rollback()`, `savepoint()`)
+- `IStatement`      — prepared statement (`execute()`, `execute_dml()`)
+- `IResultSet`      — result iterator (`next()`)
+- `IRow`            — row access (`get(idx)`, `get(name)`)
+- `Value`           — Null / Int64 / Float64 / Bool / Text / Blob
+- `Result<T>`       — error propagation (`qbuem::unexpected()`)
+- `Task<T>`         — coroutine return type
 
-모든 비동기 드라이버는 qbuem Reactor 이벤트 루프를 사용합니다:
+---
+
+## Async Pattern (PostgreSQL / Redis)
+
+All async drivers use the qbuem Reactor event loop:
 
 ```cpp
-// 패턴: PQsend* → async_flush → PgReadAwaiter
+// Pattern: PQsend* → async_flush → PgReadAwaiter
 static Task<PGresult*> async_params(PGconn* conn, ...) {
     PQsendQueryParams(...);
-    co_await async_flush(conn);          // PgFlushAwaiter
-    co_return co_await PgReadAwaiter{conn}; // 소켓 readable 대기
+    co_await async_flush(conn);           // PgFlushAwaiter
+    co_return co_await PgReadAwaiter{conn}; // wait for socket readable
 }
 ```
 
-Awaiter 작성 규칙:
-1. `await_ready()` — 즉시 완료 가능하면 true 반환 (락 없이)
-2. `await_suspend()` — Reactor에 이벤트 등록 후 yield
-3. `await_resume()` — 결과 반환
+Awaiter rules:
+1. `await_ready()` — return true if immediately complete (no lock needed)
+2. `await_suspend()` — register event with Reactor, then yield
+3. `await_resume()` — return result
 
-## ORM 사용 패턴
+**Critical**: call `reactor->post()` to resume from event handler — never call `handle.resume()` directly from an event handler.
 
-Dialect 설정 필수: MySQL/SQLite는 반드시 `.dialect()` 지정. 미지정 시 PostgreSQL 기본값.
+---
+
+## ORM Usage
+
+**Dialect must be set for MySQL/SQLite.** Default is PostgreSQL.
 
 ```cpp
-// 1. 등록 (app startup, 1회)
-// PostgreSQL (기본)
+// 1. Registration (once at app startup)
 orm::register_table<User>("users")
     .pk("id", &User::id)
     .col("email", &User::email)
     .col("name", &User::name);
 
-// MySQL / SQLite
+// MySQL / SQLite — must set dialect
 orm::register_table<User>("users")
-    .dialect(Dialect::MySQL)     // 또는 Dialect::SQLite
+    .dialect(Dialect::MySQL)   // or Dialect::SQLite
     .pk("id", &User::id)
-    .col("email", &User::email)
-    .col("name", &User::name);
+    .col("email", &User::email);
 
-// 2. SQL 생성
+// 2. SQL generation
 auto& m = orm::meta<User>();
 m.sql_insert()                                  // PG: VALUES ($1,$2) RETURNING * / MySQL: VALUES (?,?)
 m.sql_select_where("email")                     // WHERE email=$1 / ?
-m.sql_select_where_in("id", ids.size())         // WHERE id IN ($1,$2,$3) / (?,?,?)
+m.sql_select_where_in("id", ids.size())         // WHERE id IN ($1,$2,$3)
 m.sql_select_where_null("bio")                  // WHERE bio IS NULL
 m.sql_select_where_between("age")               // WHERE age BETWEEN $1 AND $2
 m.sql_select_where_like("name")                 // WHERE name LIKE $1
 m.sql_select_where_paged("email", 1, 2, 3)     // WHERE email=$1 LIMIT $2 OFFSET $3
-m.sql_count_where("email")                      // SELECT COUNT(*) FROM users WHERE email=$1
-m.sql_count_where_in("id", n)                   // SELECT COUNT(*) WHERE id IN (…)
-m.sql_upsert_pk()                               // PG/SQLite: ON CONFLICT EXCLUDED / MySQL: ON DUPLICATE KEY
+m.sql_count_where("email")                      // SELECT COUNT(*) WHERE email=$1
+m.sql_count_where_in("id", n)
+m.sql_upsert_pk()                               // PG/SQLite: ON CONFLICT / MySQL: ON DUPLICATE KEY
 m.sql_insert_batch(3)                           // INSERT VALUES ($1,…),($4,…),($7,…)
 
-// 3. 바인딩
-auto params = m.bind_insert(user);              // non-PK 값
-auto params = m.bind_update(user);              // non-PK + PK (마지막)
-auto params = m.bind_batch({u1, u2, u3});       // 배치 INSERT 파라미터
+// 3. Parameter binding
+auto params = m.bind_insert(user);              // non-PK values
+auto params = m.bind_update(user);              // non-PK first, PK last
+auto params = m.bind_batch({u1, u2, u3});       // flat params for batch INSERT
 auto params = m.bind_paged(email, 20, 0);       // WHERE + LIMIT + OFFSET
-auto params = m.bind_in(std::vector<int64_t>{1,2,3}); // IN 절 (임의 range)
+auto params = m.bind_in(std::vector<int64_t>{1,2,3}); // IN clause
 
-// 4. 결과 읽기
-User u = m.read_row(*row);                      // 컬럼명 기반
-User u = m.read_row_indexed(*row);              // 인덱스 기반 (더 빠름)
+// 4. Result reading
+User u = m.read_row(*row);          // column-name based
+User u = m.read_row_indexed(*row);  // index-based (faster)
 ```
 
-## 드라이버 DSN 형식
+---
 
-| 드라이버 | DSN |
-|---------|-----|
+## Driver DSN Format
+
+| Driver | DSN |
+|--------|-----|
 | PostgreSQL | `postgresql://user:pass@host:5432/db` |
-| SQLite3 | `sqlite:///path/to/file.db` 또는 `sqlite://:memory:` |
+| SQLite3 | `sqlite:///path/to/file.db` or `sqlite://:memory:` |
 | MySQL | `mysql://user:pass@host:3306/db[?ssl=true]` |
 | Redis | `redis://[:pass@]host[:port][/db]` |
 
-## 마이그레이션
+---
+
+## Migration
 
 ```cpp
 #include "db/migration/migrator.hpp"
-using namespace qbuem_routine::migration;
+using namespace qbuem::db::migration;
 
 static const std::vector<Migration> kMigrations = {
     { .version=1, .description="init schema",
@@ -115,26 +138,29 @@ static const std::vector<Migration> kMigrations = {
       .down="DROP TABLE ..." },
 };
 
-// PlaceholderStyle::Dollar  → PostgreSQL ($1, $2)
+// PlaceholderStyle::Dollar   → PostgreSQL ($1, $2)
 // PlaceholderStyle::Question → MySQL/SQLite (?, ?)
 MigrationRunner runner{kMigrations, *conn, PlaceholderStyle::Dollar};
-co_await runner.migrate();           // 미적용 전부
-co_await runner.migrate_to(3);       // 3버전까지
-co_await runner.rollback();          // 최신 1개 롤백
-co_await runner.rollback_to(1);      // 1버전 초과분 전부 롤백
-auto status = co_await runner.status(); // 적용 현황
+co_await runner.migrate();           // apply all pending
+co_await runner.migrate_to(3);       // apply up to version 3
+co_await runner.rollback();          // roll back latest one
+co_await runner.rollback_to(1);      // roll back all above version 1
+auto status = co_await runner.status();
 ```
 
-## 새 드라이버 추가 시 체크리스트
+---
 
-1. `src/db/<name>_driver.hpp` — `make_<name>_driver()` 팩토리 선언
-2. `src/db/<name>_driver.cpp` — `IDBDriver` / `IConnectionPool` / `IConnection` /
-   `ITransaction` / `IStatement` 구현
-3. `CMakeLists.txt` — 새 `add_library` 타겟 추가 및 `qbuem-db::<name>_driver` alias
-4. `README.md` — 드라이버 표와 DSN 형식, 사용법 추가
-5. `llms.txt` / `llms_full.txt` — 업데이트
+## Adding a New Driver — Checklist
 
-## 빌드
+1. `src/db/<name>_driver.hpp` — declare `make_<name>_driver()` factory
+2. `src/db/<name>_driver.cpp` — implement `IDBDriver` / `IConnectionPool` / `IConnection` / `ITransaction` / `IStatement`
+3. `CMakeLists.txt` — add `add_library` target + `qbuem-db::<name>_driver` alias
+4. `README.md` — add driver table entry, DSN format, and usage example
+5. `llms.txt` / `CLAUDE.md` — update
+
+---
+
+## Build
 
 ```bash
 cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -143,73 +169,93 @@ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build
 ```
 
-**옵션:**
-- `-DQBUEM_DB_MYSQL=OFF`  — MySQL 드라이버 비활성화
-- `-DQBUEM_DB_REDIS=OFF`  — Redis 클라이언트 비활성화
+**Options:**
+- `-DQBUEM_DB_MYSQL=OFF` — disable MySQL driver
+- `-DQBUEM_DB_REDIS=OFF` — disable Redis client
 
-**요구사항:**
-- GCC ≥ 13 / Clang ≥ 17
-- CMake ≥ 3.20
-- ninja-build
-- C 컴파일러 (libpq 소스 빌드)
-- `libmysqlclient-dev` (MySQL 드라이버, 선택)
+**Requirements:** GCC ≥ 13 / Clang ≥ 17, CMake ≥ 3.20, ninja-build, C compiler (for libpq source build), `libmysqlclient-dev` (optional, MySQL driver).
 
-## 코딩 스타일
+---
 
-- C++23 기능 적극 활용 (`std::byteswap`, `std::format`, Concepts)
-- 모든 공개 함수 `[[nodiscard]]` 적용
-- 에러: `Result<T>` 반환, 예외 최소화
-- 동기 드라이버: `std::mutex` 직렬화 (SQLite3, MySQL 패턴)
-- 비동기 드라이버: Reactor 이벤트 + coroutine awaiter (PG, Redis 패턴)
-- Awaiter에서 `reactor->post()` 로 resume — 이벤트 핸들러에서 직접 resume 금지
+## Coding Style
 
-## Zero-Latency / Zero-Copy 설계 원칙
+- Use C++23 features aggressively (`std::byteswap`, `std::format`, Concepts)
+- `[[nodiscard]]` on all public functions
+- Errors: return `Result<T>`, minimize exceptions
+- Sync drivers: `std::mutex` serialization (SQLite3, MySQL pattern)
+- Async drivers: Reactor events + coroutine awaiters (PG, Redis pattern)
+- Resume via `reactor->post()` from event handler — never call `handle.resume()` directly
 
-드라이버 전반에 걸쳐 적용되는 성능 설계 원칙:
+---
 
-### Zero-Copy 파라미터 바인딩
+## Performance Design
 
-- **MySQL**: `exec_stmt()` 에서 Text/Blob 파라미터는 복사 없이 `Value`의 `string_view` /
-  `BufferView` 포인터를 `MYSQL_BIND.buffer` 에 직접 설정 (`const_cast<void*>` 사용).
-  `str_bufs` 벡터 할당 불필요. params span은 `mysql_stmt_execute()` 완료까지 유효함이 보장됨.
-- **SQLite**: `bind_value()` 에서 `SQLITE_STATIC` 사용 — `sqlite3_step()` 완료까지
-  params span이 유효하므로 복사 불필요. `SQLITE_TRANSIENT` 대비 alloc 0회.
-- **PostgreSQL**: `PgParams` 구조체가 `string_view` 배열로 params를 zero-copy 참조.
+### Zero-Copy Parameter Binding
 
-### Prepared Statement 캐싱
+- **MySQL**: `exec_stmt()` sets `MYSQL_BIND.buffer` directly to the `Value`'s `string_view` / `BufferView` pointer (`const_cast<void*>`). No `str_bufs` vector allocation. The params span remains valid until `mysql_stmt_execute()` completes.
+- **SQLite**: `bind_value()` uses `SQLITE_STATIC` — params span valid until `sqlite3_step()` completes. Zero allocs vs. `SQLITE_TRANSIENT`.
+- **PostgreSQL**: `PgParams` struct references params as `string_view` array — zero-copy.
 
-- **MySQL `MysqlStatement`**: `MYSQL_STMT*`를 객체 수명 동안 캐시. 재실행 시
-  `mysql_stmt_reset()` 후 재사용 — prepare 오버헤드 제거.
-- **SQLite `SqliteStatement`**: `sqlite3_stmt*` 캐시 + `sqlite3_reset()` + `sqlite3_clear_bindings()`.
-- **PostgreSQL**: 이름 있는 Prepared Statement (`PREPARE` / `EXECUTE`).
+### Prepared Statement Caching
 
-### TCP 레이턴시 최소화
+- **MySQL `MysqlStatement`**: caches `MYSQL_STMT*` for object lifetime. `mysql_stmt_reset()` before reuse — no re-prepare overhead.
+- **SQLite `SqliteStatement`**: caches `sqlite3_stmt*` with `sqlite3_reset()` + `sqlite3_clear_bindings()`.
+- **PostgreSQL**: named prepared statements (`PREPARE` / `EXECUTE`).
 
-- **PostgreSQL / Redis**: `TCP_NODELAY` 설정 — 소형 패킷 즉시 전송 (Nagle 비활성화).
-- **MySQL**: `MYSQL_OPT_TCP_KEEPIDLE` / `KEEPINTERVAL` / `KEEPCOUNT` 설정 —
-  클라우드 방화벽 idle drop 대응.
-- **Redis**: `SOCK_NONBLOCK` + Reactor 기반 비동기 — 블로킹 없이 이벤트 루프 통합.
+### TCP Latency
 
-### SQLite 성능 PRAGMA
+- **PostgreSQL / Redis**: `TCP_NODELAY` — immediate small packet transmission (Nagle disabled).
+- **MySQL**: `MYSQL_OPT_TCP_KEEPIDLE` / `KEEPINTERVAL` / `KEEPCOUNT` — prevents cloud firewall idle drops.
+- **Redis**: `SOCK_NONBLOCK` + Reactor — non-blocking event loop integration.
 
-| PRAGMA | 값 | 효과 |
-|--------|-----|------|
-| `journal_mode` | `WAL` | 동시 읽기 허용 |
-| `synchronous` | `NORMAL` | fsync 빈도 감소 |
-| `cache_size` | `-65536` | 64MB 페이지 캐시 |
-| `temp_store` | `MEMORY` | 임시 테이블 in-memory |
+### SQLite Performance PRAGMAs
+
+| PRAGMA | Value | Effect |
+|--------|-------|--------|
+| `journal_mode` | `WAL` | Allows concurrent reads |
+| `synchronous` | `NORMAL` | Reduces fsync frequency |
+| `cache_size` | `-65536` | 64MB page cache |
+| `temp_store` | `MEMORY` | Temporary tables in memory |
 | `mmap_size` | `268435456` | 256MB mmap I/O |
-| `page_size` | `4096` | 신규 DB 페이지 크기 |
+| `page_size` | `4096` | Page size for new databases |
 
-## 흔한 실수
+---
 
-- `PQsend*` / MySQL send 함수는 반드시 **락 안에서** 호출,
-  `co_await` (flush, read) 는 **락 밖에서** 수행
-- SQLite3는 FULLMUTEX 모드이므로 이중 잠금 주의
-- ORM `bind_batch()` 는 `sql_insert_batch(n)` 과 **n이 일치**해야 함
-- **ORM Dialect 미설정**: MySQL/SQLite에서 `.dialect()` 없이 쓰면 `$N` 플레이스홀더와
-  `RETURNING *`가 생성되어 런타임 SQL 오류 발생
-- **`sql_upsert_pk()` MySQL**: `ON CONFLICT` 대신 `ON DUPLICATE KEY UPDATE` 자동 생성됨 —
-  Dialect가 올바르게 설정되어 있어야 함
-- **`bind_in(ids)`**: `ids`가 비어 있으면 `WHERE col IN ()` 이 되어 SQL 오류 발생 — 호출 전 empty 체크 필요
-- **`sql_insert_batch(n)`**: n=0 또는 non-PK 컬럼이 없는 테이블에서 assert 실패
+## Common Mistakes
+
+- `PQsend*` / MySQL send functions must be called **inside the lock**; `co_await` (flush, read) must happen **outside the lock**
+- SQLite3 uses FULLMUTEX mode — beware of double-locking
+- ORM `bind_batch()` requires **n matching** `sql_insert_batch(n)`
+- **Missing ORM dialect**: MySQL/SQLite without `.dialect()` generates `$N` placeholders + `RETURNING *` → runtime SQL error
+- **`sql_upsert_pk()` MySQL**: generates `ON DUPLICATE KEY UPDATE` not `ON CONFLICT` — dialect must be set correctly
+- **`bind_in(ids)`**: empty `ids` produces `WHERE col IN ()` → SQL error; check `empty()` before calling
+- **`sql_insert_batch(n)`**: asserts on n=0 or tables with no non-PK columns
+
+---
+
+## Cross-Repo Guidelines
+
+### Ecosystem Map
+
+| Repo | Role | Key headers |
+|------|------|-------------|
+| **qbuem-stack** | Platform: async I/O, HTTP, pipelines, crypto, middleware | `<qbuem/http/*>`, `<qbuem/middleware/*>`, `<qbuem/crypto/*>` |
+| **qbuem-auth** | Auth layer: JWT, HTTPS client, OAuth2 | `src/auth/jwt.hpp`, `src/auth/https_client.hpp`, `src/auth/oauth.hpp` |
+| **qbuem-db** | DB layer: async drivers, ORM, migrations | `src/db/orm.hpp`, `src/db/*_driver.hpp` |
+| **application repos** | WAS applications built on the above | depend on stack + auth + db; must not duplicate platform code |
+
+### Filing Platform-Level Issues
+
+When implementing a feature here requires functionality that belongs in a lower-level library,
+**file an issue in the correct repo** rather than implementing it locally.
+
+| Need | File issue at |
+|------|--------------|
+| New async primitive, protocol, or middleware | [qbuem-stack issues](https://github.com/qbuem/qbuem-stack/issues) |
+| HTTPS client feature, JWT, OAuth provider | [qbuem-auth issues](https://github.com/qbuem/qbuem-auth/issues) |
+| DB driver, ORM, migration feature | [qbuem-db issues](https://github.com/qbuem/qbuem-db/issues) |
+
+If a temporary local workaround is necessary while waiting for an upstream fix, mark it:
+```cpp
+// TODO: remove after qbuem-db#NNN is merged
+```
