@@ -9,6 +9,7 @@
 #include <atomic>
 #include <bit>        // std::byteswap, std::endian (C++23)
 #include <charconv>
+#include <chrono>
 #include <coroutine>
 #include <cstring>
 #include <fcntl.h>    // fcntl, O_NONBLOCK
@@ -410,15 +411,25 @@ static void make_nonblocking(PGconn* conn) noexcept {
 // ─── Slot ─────────────────────────────────────────────────────────────────────
 
 struct Slot {
-    PGconn*    conn{nullptr};
-    std::mutex mutex;          // PQsend* 호출 직렬화 (비동기 대기 구간 제외)
-    uint64_t   stmt_counter{0};
+    using Clock = std::chrono::steady_clock;
+
+    PGconn*          conn{nullptr};
+    std::mutex       mutex;          // PQsend* 호출 직렬화 (비동기 대기 구간 제외)
+    uint64_t         stmt_counter{0};
+    Clock::time_point idle_since{Clock::now()};
 
     explicit Slot(PGconn* c) noexcept : conn(c) { make_nonblocking(c); }
     ~Slot() { if (conn) PQfinish(conn); }
 
     Slot(const Slot&)            = delete;
     Slot& operator=(const Slot&) = delete;
+
+    void mark_idle() noexcept { idle_since = Clock::now(); }
+
+    // 30초 이상 idle 상태 → 클라우드 방화벽/로드밸런서가 연결을 끊었을 수 있음
+    [[nodiscard]] bool needs_liveness_check() const noexcept {
+        return (Clock::now() - idle_since) > std::chrono::seconds{30};
+    }
 };
 
 // ─── PgAcquireAwaiter — 풀 소진 시 대기 ─────────────────────────────────────
@@ -683,6 +694,32 @@ public:
 
             if (PQstatus(slot->conn) != CONNECTION_OK) PQreset(slot->conn);
             if (PQstatus(slot->conn) == CONNECTION_OK) {
+                // 30초 이상 idle → 클라우드 방화벽이 TCP를 silently drop 했을 수 있음.
+                // PQstatus()는 로컬 상태만 반영하므로 비동기 SELECT 1로 실제 활성 여부 확인.
+                if (slot->needs_liveness_check()) {
+                    bool alive = false;
+                    {
+                        std::lock_guard lk{slot->mutex};
+                        alive = (PQsendQuery(slot->conn, "SELECT 1") != 0);
+                    }
+                    if (alive) alive = co_await async_flush(slot->conn);
+                    if (alive) {
+                        PGresult* res = co_await PgReadAwaiter{slot->conn};
+                        alive = res && (PQresultStatus(res) == PGRES_TUPLES_OK);
+                        if (res) PQclear(res);
+                    }
+                    if (!alive) {
+                        // ping 실패 → 재연결 시도
+                        PGconn* fresh = PQconnectdb(conninfo_.c_str());
+                        if (fresh && PQstatus(fresh) == CONNECTION_OK) {
+                            PQfinish(slot->conn); slot->conn = fresh; make_nonblocking(fresh);
+                        } else {
+                            if (fresh) PQfinish(fresh);
+                            lock.lock(); // 이 슬롯 스킵, 다음 탐색
+                            continue;
+                        }
+                    }
+                }
                 active_.fetch_add(1, std::memory_order_relaxed);
                 co_return std::make_unique<PgConnection>(slot, idx, this);
             }
@@ -737,6 +774,7 @@ public:
             // waiter 의 reactor thread 에서 resume
             reactor->post([h]() mutable { h.resume(); });
         } else {
+            slots_[idx]->mark_idle();
             idle_.push(idx);
         }
     }
