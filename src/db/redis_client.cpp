@@ -20,26 +20,6 @@ using namespace qbuem;
 
 namespace qbuem_routine::redis {
 
-// ── 에러 ─────────────────────────────────────────────────────────────────────
-
-std::string RedisErrorCategory::message(int code) const {
-    switch (static_cast<RedisError>(code)) {
-        case RedisError::Ok:               return "ok";
-        case RedisError::ConnectionFailed: return "redis: connection failed";
-        case RedisError::ConnectionClosed: return "redis: connection closed";
-        case RedisError::ProtocolError:    return "redis: protocol error";
-        case RedisError::AuthFailed:       return "redis: auth failed";
-        case RedisError::CommandError:     return "redis: command error";
-        case RedisError::Timeout:          return "redis: timeout";
-    }
-    return "redis: unknown error";
-}
-
-std::error_code make_error(RedisError e) {
-    static RedisErrorCategory cat;
-    return {static_cast<int>(e), cat};
-}
-
 // ── DSN 파서 ─────────────────────────────────────────────────────────────────
 
 struct RedisDsn {
@@ -312,32 +292,80 @@ struct RedisWriteAwaiter {
 
 class RedisClientImpl {
 public:
-    explicit RedisClientImpl(int fd) noexcept : fd_(fd) {}
+    RedisClientImpl(int fd, RedisDsn dsn) noexcept
+        : fd_(fd), dsn_(std::move(dsn)) {}
 
-    ~RedisClientImpl() {
-        if (fd_ >= 0) {
-            auto* reactor = Reactor::current();
-            if (reactor) {
-                reactor->unregister_event(fd_, EventType::Read);
-                reactor->unregister_event(fd_, EventType::Write);
-            }
-            ::close(fd_);
-        }
-    }
+    ~RedisClientImpl() { close_fd(); }
 
     RedisClientImpl(const RedisClientImpl&)            = delete;
     RedisClientImpl& operator=(const RedisClientImpl&) = delete;
 
+    // 연결 끊김 시 재연결 + AUTH + SELECT 재수행
+    Task<bool> reconnect() {
+        close_fd();
+        parser_ = RespParser{};
+
+        const int fd = connect_tcp(dsn_);
+        if (fd < 0) co_return false;
+
+        RedisConnectAwaiter conn_aw{fd};
+        if (!conn_aw.await_ready()) {
+            if (!co_await conn_aw) { ::close(fd); co_return false; }
+        }
+        fd_ = fd;
+
+        if (!dsn_.password.empty()) {
+            std::vector<std::string> auth_args;
+            if (!dsn_.username.empty())
+                auth_args = {"AUTH", dsn_.username, dsn_.password};
+            else
+                auth_args = {"AUTH", dsn_.password};
+            auto r = co_await send_once(std::move(auth_args));
+            if (!r || !(*r).is_ok()) { close_fd(); co_return false; }
+        }
+        if (dsn_.db > 0) {
+            auto r = co_await send_once({"SELECT", std::to_string(dsn_.db)});
+            if (!r) { close_fd(); co_return false; }
+        }
+        co_return true;
+    }
+
+    // ConnectionFailed 시 재연결 후 1회 재시도
     Task<Result<RedisValue>> send(std::vector<std::string> args) {
+        auto r = co_await send_once(args);
+        if (r || r.error() != db_error(DbError::ConnectionFailed))
+            co_return r;
+
+        // 재연결 후 재시도
+        if (!co_await reconnect())
+            co_return unexpected(db_error(DbError::ConnectionFailed));
+        co_return co_await send_once(std::move(args));
+    }
+
+    [[nodiscard]] int fd() const noexcept { return fd_; }
+
+private:
+    void close_fd() noexcept {
+        if (fd_ < 0) return;
+        auto* reactor = Reactor::current();
+        if (reactor) {
+            reactor->unregister_event(fd_, EventType::Read);
+            reactor->unregister_event(fd_, EventType::Write);
+        }
+        ::close(fd_);
+        fd_ = -1;
+    }
+
+    Task<Result<RedisValue>> send_once(std::vector<std::string> args) {
         auto encoded = encode_resp(args);
 
         // 쓰기
         RedisWriteAwaiter write_aw{fd_, std::move(encoded)};
         if (!write_aw.await_ready()) {
             if (!co_await write_aw)
-                co_return unexpected(make_error(RedisError::ConnectionClosed));
+                co_return unexpected(db_error(DbError::ConnectionFailed));
         } else if (write_aw.error) {
-            co_return unexpected(make_error(RedisError::ConnectionClosed));
+            co_return unexpected(db_error(DbError::ConnectionFailed));
         }
 
         // 읽기
@@ -348,19 +376,17 @@ public:
         } else {
             val = co_await read_aw;
             if (read_aw.error)
-                co_return unexpected(make_error(RedisError::ConnectionClosed));
+                co_return unexpected(db_error(DbError::ConnectionFailed));
         }
 
         if (val.is_error())
-            co_return unexpected(make_error(RedisError::CommandError));
+            co_return unexpected(db_error(DbError::QueryFailed));
 
         co_return val;
     }
 
-    [[nodiscard]] int fd() const noexcept { return fd_; }
-
-private:
     int        fd_;
+    RedisDsn   dsn_;
     RespParser parser_;
 };
 
@@ -441,18 +467,18 @@ RedisClient::connect(std::string_view dsn) {
 
     const int fd = connect_tcp(parsed);
     if (fd < 0)
-        co_return unexpected(make_error(RedisError::ConnectionFailed));
+        co_return unexpected(db_error(DbError::ConnectionFailed));
 
     // 비동기 연결 완료 대기
     RedisConnectAwaiter conn_aw{fd};
     if (!conn_aw.await_ready()) {
         if (!co_await conn_aw) {
             ::close(fd);
-            co_return unexpected(make_error(RedisError::ConnectionFailed));
+            co_return unexpected(db_error(DbError::ConnectionFailed));
         }
     }
 
-    auto impl = std::make_unique<RedisClientImpl>(fd);
+    auto impl = std::make_unique<RedisClientImpl>(fd, parsed);
     auto client = std::make_unique<RedisClient>(std::move(impl));
 
     // AUTH (비밀번호가 있을 때)
@@ -465,7 +491,7 @@ RedisClient::connect(std::string_view dsn) {
         }
         auto res = co_await client->impl_->send(std::move(auth_args));
         if (!res || !(*res).is_ok())
-            co_return unexpected(make_error(RedisError::AuthFailed));
+            co_return unexpected(db_error(DbError::ConnectionFailed));
     }
 
     // SELECT db

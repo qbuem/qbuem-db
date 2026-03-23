@@ -43,6 +43,8 @@
  * ```
  */
 
+#include "db_error.hpp"
+
 #include <qbuem/core/task.hpp>
 #include <qbuem/db/driver.hpp>  // Result, unexpected
 
@@ -89,25 +91,6 @@ struct RedisValue {
     [[nodiscard]] int64_t            as_int()     const noexcept { return integer; }
     [[nodiscard]] const std::vector<RedisValue>& as_array() const noexcept { return array; }
 };
-
-// ── 에러 코드 ─────────────────────────────────────────────────────────────────
-
-struct RedisErrorCategory : std::error_category {
-    const char* name() const noexcept override { return "redis"; }
-    std::string message(int code) const override;
-};
-
-enum class RedisError : int {
-    Ok = 0,
-    ConnectionFailed    = 1,
-    ConnectionClosed    = 2,
-    ProtocolError       = 3,
-    AuthFailed          = 4,
-    CommandError        = 5,
-    Timeout             = 6,
-};
-
-std::error_code make_error(RedisError e);
 
 // ── RedisClient ───────────────────────────────────────────────────────────────
 
