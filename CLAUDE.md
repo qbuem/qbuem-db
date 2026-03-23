@@ -163,6 +163,44 @@ cmake --build build
 - 비동기 드라이버: Reactor 이벤트 + coroutine awaiter (PG, Redis 패턴)
 - Awaiter에서 `reactor->post()` 로 resume — 이벤트 핸들러에서 직접 resume 금지
 
+## Zero-Latency / Zero-Copy 설계 원칙
+
+드라이버 전반에 걸쳐 적용되는 성능 설계 원칙:
+
+### Zero-Copy 파라미터 바인딩
+
+- **MySQL**: `exec_stmt()` 에서 Text/Blob 파라미터는 복사 없이 `Value`의 `string_view` /
+  `BufferView` 포인터를 `MYSQL_BIND.buffer` 에 직접 설정 (`const_cast<void*>` 사용).
+  `str_bufs` 벡터 할당 불필요. params span은 `mysql_stmt_execute()` 완료까지 유효함이 보장됨.
+- **SQLite**: `bind_value()` 에서 `SQLITE_STATIC` 사용 — `sqlite3_step()` 완료까지
+  params span이 유효하므로 복사 불필요. `SQLITE_TRANSIENT` 대비 alloc 0회.
+- **PostgreSQL**: `PgParams` 구조체가 `string_view` 배열로 params를 zero-copy 참조.
+
+### Prepared Statement 캐싱
+
+- **MySQL `MysqlStatement`**: `MYSQL_STMT*`를 객체 수명 동안 캐시. 재실행 시
+  `mysql_stmt_reset()` 후 재사용 — prepare 오버헤드 제거.
+- **SQLite `SqliteStatement`**: `sqlite3_stmt*` 캐시 + `sqlite3_reset()` + `sqlite3_clear_bindings()`.
+- **PostgreSQL**: 이름 있는 Prepared Statement (`PREPARE` / `EXECUTE`).
+
+### TCP 레이턴시 최소화
+
+- **PostgreSQL / Redis**: `TCP_NODELAY` 설정 — 소형 패킷 즉시 전송 (Nagle 비활성화).
+- **MySQL**: `MYSQL_OPT_TCP_KEEPIDLE` / `KEEPINTERVAL` / `KEEPCOUNT` 설정 —
+  클라우드 방화벽 idle drop 대응.
+- **Redis**: `SOCK_NONBLOCK` + Reactor 기반 비동기 — 블로킹 없이 이벤트 루프 통합.
+
+### SQLite 성능 PRAGMA
+
+| PRAGMA | 값 | 효과 |
+|--------|-----|------|
+| `journal_mode` | `WAL` | 동시 읽기 허용 |
+| `synchronous` | `NORMAL` | fsync 빈도 감소 |
+| `cache_size` | `-65536` | 64MB 페이지 캐시 |
+| `temp_store` | `MEMORY` | 임시 테이블 in-memory |
+| `mmap_size` | `268435456` | 256MB mmap I/O |
+| `page_size` | `4096` | 신규 DB 페이지 크기 |
+
 ## 흔한 실수
 
 - `PQsend*` / MySQL send 함수는 반드시 **락 안에서** 호출,

@@ -140,14 +140,15 @@ static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
             break;
         case Value::Type::Text: {
             auto sv = v.get<std::string_view>();
+            // SQLITE_STATIC: params span은 sqlite3_step 완료까지 유효
             sqlite3_bind_text(stmt, idx, sv.data(),
-                              static_cast<int>(sv.size()), SQLITE_TRANSIENT);
+                              static_cast<int>(sv.size()), SQLITE_STATIC);
             break;
         }
         case Value::Type::Blob: {
             auto bv = v.get<BufferView>();
             sqlite3_bind_blob(stmt, idx, bv.data(),
-                              static_cast<int>(bv.size()), SQLITE_TRANSIENT);
+                              static_cast<int>(bv.size()), SQLITE_STATIC);
             break;
         }
     }
@@ -403,9 +404,14 @@ public:
             return;
         }
         // WAL 모드: 동시 읽기 허용, 쓰기 직렬화
-        sqlite3_exec(db_, "PRAGMA journal_mode=WAL",  nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "PRAGMA foreign_keys=ON",    nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);
+        sqlite3_exec(db_, "PRAGMA foreign_keys=ON",         nullptr, nullptr, nullptr);
+        // 성능 최적화
+        sqlite3_exec(db_, "PRAGMA cache_size=-65536",       nullptr, nullptr, nullptr); // 64MB 페이지 캐시
+        sqlite3_exec(db_, "PRAGMA temp_store=MEMORY",       nullptr, nullptr, nullptr); // 임시 테이블 메모리
+        sqlite3_exec(db_, "PRAGMA mmap_size=268435456",     nullptr, nullptr, nullptr); // 256MB mmap
+        sqlite3_exec(db_, "PRAGMA page_size=4096",          nullptr, nullptr, nullptr); // 4KB 페이지 (신규 DB만)
     }
 
     ~SqliteConnectionPool() override {

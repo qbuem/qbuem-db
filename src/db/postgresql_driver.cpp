@@ -98,76 +98,116 @@ static CellData read_pg_column_binary(PGresult* res, int row, int col) noexcept 
     return c;
 }
 
-// ─── Value → 파라미터 문자열 ──────────────────────────────────────────────────
-
-static std::string value_to_pg_string(const Value& v) {
-    switch (v.type()) {
-        case Value::Type::Null:    return "";
-        case Value::Type::Bool:    return v.get<int64_t>() ? "t" : "f";
-        case Value::Type::Int64:   return std::to_string(v.get<int64_t>());
-        case Value::Type::Float64: return std::to_string(v.get<double>());
-        case Value::Type::Text: {
-            auto sv = v.get<std::string_view>();
-            return std::string(sv);
-        }
-        case Value::Type::Blob: {
-            auto bv = v.get<BufferView>();
-            std::string r = "\\x";
-            r.reserve(2 + bv.size() * 2);
-            static constexpr char kHex[] = "0123456789abcdef";
-            for (auto b : bv) {
-                const uint8_t byte = std::to_integer<uint8_t>(b);
-                r += kHex[(byte >> 4) & 0xF];
-                r += kHex[byte & 0xF];
-            }
-            return r;
-        }
-    }
-    return "";
-}
-
-// ─── PgParams — 스택 우선 파라미터 배열 ──────────────────────────────────────
+// ─── PgParams — zero-alloc 파라미터 배열 ─────────────────────────────────────
+//
+// 설계 원칙:
+//  • Text  → string_view 포인터 직접 사용 (zero-copy, 할당 없음)
+//  • Null  → nullptr (할당 없음)
+//  • Bool  → 정적 리터럴 "t"/"f" (할당 없음)
+//  • Int64 / Float64 → 스택 고정 버퍼에 to_chars (할당 없음)
+//  • Blob  → hex 변환만 blob_bufs_ 에 std::string 할당 (드문 경우)
+//
+// ≤16 파라미터: 완전 스택 (힙 0회)
+// >16 파라미터: values/lengths/formats + num_bufs 만 힙 1회
 
 struct PgParams {
-    static constexpr size_t kInline = 16;
+    static constexpr size_t kInline   = 16;
+    static constexpr size_t kNumBufSz = 32; // int64_t 최대 20자 + double 최대 ~24자
 
-    std::string strings_inline_[kInline];
+    // ── 인라인 스토리지 (≤kInline) ──────────────────────────────────────────
+    char        num_buf_[kInline][kNumBufSz]{};  // 숫자/bool 직렬화 버퍼
     const char* values_inline_[kInline]{};
     int         lengths_inline_[kInline]{};
     int         formats_inline_[kInline]{};
 
-    std::vector<std::string> strings_heap_;
-    std::vector<const char*> values_heap_;
-    std::vector<int>         lengths_heap_;
-    std::vector<int>         formats_heap_;
+    // ── 힙 스토리지 (>kInline) ──────────────────────────────────────────────
+    std::vector<std::array<char, kNumBufSz>> num_buf_heap_;
+    std::vector<const char*>                 values_heap_;
+    std::vector<int>                         lengths_heap_;
+    std::vector<int>                         formats_heap_;
 
-    std::string* strings_{nullptr};
+    // ── Blob 변환 버퍼 (드문 경우만) ───────────────────────────────────────
+    std::vector<std::string> blob_bufs_;
+
     const char** values_{nullptr};
     int*         lengths_{nullptr};
     int*         formats_{nullptr};
     int          count_{0};
 
     void build(std::span<const Value> params) {
-        count_ = static_cast<int>(params.size());
-        if (static_cast<size_t>(count_) <= kInline) {
-            strings_ = strings_inline_; values_  = values_inline_;
-            lengths_ = lengths_inline_; formats_ = formats_inline_;
+        count_          = static_cast<int>(params.size());
+        const size_t n  = static_cast<size_t>(count_);
+
+        char* nbuf_base = nullptr;
+        if (n <= kInline) {
+            values_  = values_inline_;
+            lengths_ = lengths_inline_;
+            formats_ = formats_inline_;
+            nbuf_base = num_buf_[0];
         } else {
-            strings_heap_.resize(static_cast<size_t>(count_));
-            values_heap_.resize(static_cast<size_t>(count_));
-            lengths_heap_.resize(static_cast<size_t>(count_));
-            formats_heap_.resize(static_cast<size_t>(count_));
-            strings_ = strings_heap_.data(); values_  = values_heap_.data();
-            lengths_ = lengths_heap_.data(); formats_ = formats_heap_.data();
+            num_buf_heap_.resize(n);
+            values_heap_.resize(n);
+            lengths_heap_.resize(n);
+            formats_heap_.resize(n);
+            values_  = values_heap_.data();
+            lengths_ = lengths_heap_.data();
+            formats_ = formats_heap_.data();
         }
+
+        blob_bufs_.reserve(n); // Blob 있을 때 재할당 방지 (포인터 안정성)
+
+        static constexpr char kHex[] = "0123456789abcdef";
+
         for (int i = 0; i < count_; ++i) {
-            formats_[i] = 0;
-            if (params[static_cast<size_t>(i)].type() == Value::Type::Null) {
-                values_[i] = nullptr; lengths_[i] = 0;
-            } else {
-                strings_[i]  = value_to_pg_string(params[static_cast<size_t>(i)]);
-                values_[i]   = strings_[i].c_str();
-                lengths_[i]  = static_cast<int>(strings_[i].size());
+            formats_[i]       = 0;
+            char* nb          = (n <= kInline) ? num_buf_[i] : num_buf_heap_[i].data();
+            const auto& v     = params[static_cast<size_t>(i)];
+
+            switch (v.type()) {
+                case Value::Type::Null:
+                    values_[i] = nullptr; lengths_[i] = 0;
+                    break;
+                case Value::Type::Text: {
+                    // zero-copy: params span은 PQsend* 완료까지 유효
+                    auto sv    = v.get<std::string_view>();
+                    values_[i] = sv.data();
+                    lengths_[i]= static_cast<int>(sv.size());
+                    break;
+                }
+                case Value::Type::Bool:
+                    values_[i] = v.get<int64_t>() ? "t" : "f";
+                    lengths_[i]= 1;
+                    break;
+                case Value::Type::Int64: {
+                    auto [ptr, _] = std::to_chars(nb, nb + kNumBufSz, v.get<int64_t>());
+                    values_[i] = nb;
+                    lengths_[i]= static_cast<int>(ptr - nb);
+                    break;
+                }
+                case Value::Type::Float64: {
+                    // chars_format::general: 최단 round-trip 표현
+                    auto [ptr, _] = std::to_chars(nb, nb + kNumBufSz,
+                                                  v.get<double>(),
+                                                  std::chars_format::general);
+                    values_[i] = nb;
+                    lengths_[i]= static_cast<int>(ptr - nb);
+                    break;
+                }
+                case Value::Type::Blob: {
+                    auto bv = v.get<BufferView>();
+                    blob_bufs_.emplace_back();
+                    auto& s = blob_bufs_.back();
+                    s.reserve(2 + bv.size() * 2);
+                    s = "\\x";
+                    for (auto b : bv) {
+                        const uint8_t byte = std::to_integer<uint8_t>(b);
+                        s += kHex[(byte >> 4) & 0xF];
+                        s += kHex[byte & 0xF];
+                    }
+                    values_[i] = s.c_str();
+                    lengths_[i]= static_cast<int>(s.size());
+                    break;
+                }
             }
         }
     }
