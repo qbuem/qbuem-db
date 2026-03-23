@@ -714,9 +714,11 @@ public:
                         if (fresh && PQstatus(fresh) == CONNECTION_OK) {
                             PQfinish(slot->conn); slot->conn = fresh; make_nonblocking(fresh);
                         } else {
+                            // 재연결 불가 → 슬롯을 idle로 돌려놓고 즉시 에러 반환
+                            // (MySQL 일관성: 슬롯 고아화 방지 + 호출자가 핸들링 가능)
                             if (fresh) PQfinish(fresh);
-                            lock.lock(); // 이 슬롯 스킵, 다음 탐색
-                            continue;
+                            lock.lock(); idle_.push(idx);
+                            co_return unexpected(pg_error());
                         }
                     }
                 }
@@ -730,8 +732,11 @@ public:
                 active_.fetch_add(1, std::memory_order_relaxed);
                 co_return std::make_unique<PgConnection>(slot, idx, this);
             }
+            // 신규 연결도 실패 → 슬롯을 idle로 돌려놓고 즉시 에러 반환
+            // (MySQL 일관성: 슬롯 고아화 방지 + DB down 시 hang 방지)
             if (fresh) PQfinish(fresh);
-            lock.lock(); // 이 슬롯 스킵, 다음 탐색
+            lock.lock(); idle_.push(idx);
+            co_return unexpected(pg_error());
         }
 
         // 2. 새 슬롯 생성
