@@ -73,12 +73,15 @@ static std::string encode_resp(const std::vector<std::string>& args) {
     std::size_t total = 16;
     for (const auto& a : args) total += 8 + a.size();
     buf.reserve(total);
+    char tmp[24]; // to_chars 스택 버퍼 — std::to_string 임시 할당 없음
     buf += '*';
-    buf += std::to_string(args.size());
+    auto [e1, _1] = std::to_chars(tmp, tmp + sizeof(tmp), args.size());
+    buf.append(tmp, e1);
     buf += "\r\n";
     for (const auto& arg : args) {
         buf += '$';
-        buf += std::to_string(arg.size());
+        auto [e2, _2] = std::to_chars(tmp, tmp + sizeof(tmp), arg.size());
+        buf.append(tmp, e2);
         buf += "\r\n";
         buf += arg;
         buf += "\r\n";
@@ -105,7 +108,11 @@ public:
     [[nodiscard]] RedisValue parse() {
         std::size_t pos = 0;
         auto val = parse_value(pos);
-        buf_.erase(0, pos);
+        // 전체 소비 시 clear() O(1), 부분 소비 시만 erase() O(n)
+        if (pos == buf_.size())
+            buf_.clear();
+        else
+            buf_.erase(0, pos);
         return val;
     }
 
