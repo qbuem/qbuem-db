@@ -1,4 +1,5 @@
 #include "postgresql_driver.hpp"
+#include "db_error.hpp"
 
 #include <libpq-fe.h>
 #include <qbuem/core/reactor.hpp>
@@ -24,18 +25,6 @@ using namespace qbuem::db;
 
 namespace qbuem_routine {
 namespace {
-
-// ─── 에러 헬퍼 ───────────────────────────────────────────────────────────────
-
-struct PgErrorCategory : std::error_category {
-    const char* name() const noexcept override { return "postgresql"; }
-    std::string message(int) const override { return "postgresql error"; }
-};
-
-inline std::error_code pg_error(int code = 1) {
-    static PgErrorCategory cat;
-    return {code, cat};
-}
 
 // ─── PostgreSQL OID 상수 ──────────────────────────────────────────────────────
 
@@ -255,7 +244,7 @@ private:
 static Result<std::unique_ptr<IResultSet>> build_result_set(PGresult* res) {
     const ExecStatusType status = PQresultStatus(res);
     if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-        PQclear(res); return unexpected(pg_error());
+        PQclear(res); return unexpected(db_error(DbError::QueryFailed));
     }
     const int nrows = PQntuples(res), ncols = PQnfields(res);
     auto col_names = std::make_shared<std::vector<std::string>>();
@@ -445,7 +434,7 @@ class PgConnection final : public IConnection; // 전방 선언 (불필요 — �
 
 struct PgAcquireAwaiter {
     PgConnectionPool*                     pool;
-    Result<std::unique_ptr<IConnection>>  result{unexpected(pg_error())};
+    Result<std::unique_ptr<IConnection>>  result{unexpected(db_error(DbError::ConnectionFailed))};
 
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) noexcept;   // 정의는 아래
@@ -479,11 +468,11 @@ public:
             if (PQsendQueryPrepared(slot_->conn, name_.c_str(),
                                     pg.n(), pg.values(), pg.lengths(),
                                     pg.formats(), 1) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::QueryFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::QueryFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::QueryFailed));
         co_return build_result_set(res);
     }
 
@@ -525,11 +514,11 @@ public:
             if (PQsendQueryParams(slot_->conn, std::string(sql).c_str(),
                                   pg.n(), nullptr,
                                   pg.values(), pg.lengths(), pg.formats(), 1) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::QueryFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::QueryFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::QueryFailed));
         auto r = build_result_set(res);
         if (!r) co_return unexpected(r.error());
         co_return (*r)->affected_rows();
@@ -541,14 +530,14 @@ private:
         {
             std::lock_guard lock{slot_->mutex};
             if (PQsendQuery(slot_->conn, sql.c_str()) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::TransactionFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::TransactionFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::TransactionFailed));
         const ExecStatusType status = PQresultStatus(res);
         PQclear(res);
-        if (status != PGRES_COMMAND_OK) co_return unexpected(pg_error());
+        if (status != PGRES_COMMAND_OK) co_return unexpected(db_error(DbError::TransactionFailed));
         co_return {};
     }
 
@@ -575,14 +564,14 @@ public:
             name = "s" + std::to_string(slot_->stmt_counter++);
             if (PQsendPrepare(slot_->conn, name.c_str(),
                               std::string(sql).c_str(), 0, nullptr) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::PrepareStatementFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::PrepareStatementFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::PrepareStatementFailed));
         const ExecStatusType status = PQresultStatus(res);
         PQclear(res);
-        if (status != PGRES_COMMAND_OK) co_return unexpected(pg_error());
+        if (status != PGRES_COMMAND_OK) co_return unexpected(db_error(DbError::PrepareStatementFailed));
         co_return std::make_unique<PgStatement>(slot_, std::move(name));
     }
 
@@ -595,11 +584,11 @@ public:
             if (PQsendQueryParams(slot_->conn, std::string(sql).c_str(),
                                   pg.n(), nullptr,
                                   pg.values(), pg.lengths(), pg.formats(), 1) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::QueryFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::QueryFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::QueryFailed));
         co_return build_result_set(res);
     }
 
@@ -616,14 +605,14 @@ public:
         {
             std::lock_guard lock{slot_->mutex};
             if (PQsendQuery(slot_->conn, sql.c_str()) == 0)
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::TransactionFailed));
         }
-        if (!co_await async_flush(slot_->conn)) co_return unexpected(pg_error());
+        if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::TransactionFailed));
         res = co_await PgReadAwaiter{slot_->conn};
-        if (!res) co_return unexpected(pg_error());
+        if (!res) co_return unexpected(db_error(DbError::TransactionFailed));
         const ExecStatusType status = PQresultStatus(res);
         PQclear(res);
-        if (status != PGRES_COMMAND_OK) co_return unexpected(pg_error());
+        if (status != PGRES_COMMAND_OK) co_return unexpected(db_error(DbError::TransactionFailed));
         state_ = ConnectionState::Transaction;
         co_return std::make_unique<PgTransaction>(slot_);
     }
@@ -718,7 +707,7 @@ public:
                             // (MySQL 일관성: 슬롯 고아화 방지 + 호출자가 핸들링 가능)
                             if (fresh) PQfinish(fresh);
                             lock.lock(); idle_.push(idx);
-                            co_return unexpected(pg_error());
+                            co_return unexpected(db_error(DbError::ConnectionFailed));
                         }
                     }
                 }
@@ -736,7 +725,7 @@ public:
             // (MySQL 일관성: 슬롯 고아화 방지 + DB down 시 hang 방지)
             if (fresh) PQfinish(fresh);
             lock.lock(); idle_.push(idx);
-            co_return unexpected(pg_error());
+            co_return unexpected(db_error(DbError::ConnectionFailed));
         }
 
         // 2. 새 슬롯 생성
@@ -749,7 +738,7 @@ public:
             if (!c || PQstatus(c) != CONNECTION_OK) {
                 if (c) PQfinish(c);
                 lock.lock(); slots_.pop_back();
-                co_return unexpected(pg_error());
+                co_return unexpected(db_error(DbError::ConnectionFailed));
             }
             auto s = std::make_unique<Slot>(c);
             Slot* slot = s.get();
@@ -844,7 +833,7 @@ public:
     pool(std::string_view dsn, PoolConfig config) override {
         auto p = std::make_unique<PgConnectionPool>(std::string(dsn),
                                                     std::move(config));
-        if (!p->is_valid()) co_return unexpected(pg_error());
+        if (!p->is_valid()) co_return unexpected(db_error(DbError::ConnectionFailed));
         co_return p;
     }
 };

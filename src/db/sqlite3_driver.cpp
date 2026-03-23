@@ -1,4 +1,5 @@
 #include "sqlite3_driver.hpp"
+#include "db_error.hpp"
 
 #include <sqlite3.h>
 #include <qbuem/core/task.hpp>
@@ -213,7 +214,7 @@ run_stmt(sqlite3* db, sqlite3_stmt* stmt, std::span<const Value> params) {
         } else if (rc == SQLITE_DONE) {
             break;
         } else {
-            return unexpected(std::error_code(rc, std::generic_category()));
+            return unexpected(db_error(DbError::QueryFailed));
         }
     }
 
@@ -252,7 +253,7 @@ public:
 
         int rc = sqlite3_step(stmt_);
         if (rc != SQLITE_DONE && rc != SQLITE_ROW)
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return static_cast<uint64_t>(sqlite3_changes(db_));
     }
 
@@ -293,7 +294,7 @@ public:
         int rc = sqlite3_prepare_v2(db_, converted.c_str(),
                                     static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::QueryFailed));
 
         for (int i = 0; i < static_cast<int>(params.size()); ++i)
             bind_value(stmt, i + 1, params[i]);
@@ -304,7 +305,7 @@ public:
         sqlite3_finalize(stmt);
 
         if (rc != SQLITE_DONE && rc != SQLITE_ROW)
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return affected;
     }
 
@@ -315,7 +316,7 @@ private:
         int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err);
         if (rc != SQLITE_OK) {
             sqlite3_free(err);
-            return unexpected(std::error_code(rc, std::generic_category()));
+            return unexpected(db_error(DbError::TransactionFailed));
         }
         return {};
     }
@@ -341,7 +342,7 @@ public:
         int rc = sqlite3_prepare_v2(db_, converted.c_str(),
                                     static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::PrepareStatementFailed));
         co_return std::make_unique<SqliteStatement>(db_, stmt, mx_);
     }
 
@@ -353,7 +354,7 @@ public:
         int rc = sqlite3_prepare_v2(db_, converted.c_str(),
                                     static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::QueryFailed));
         auto result = run_stmt(db_, stmt, params);
         sqlite3_finalize(stmt);
         co_return result;
@@ -366,7 +367,7 @@ public:
         int rc = sqlite3_exec(db_, "BEGIN", nullptr, nullptr, &err);
         if (rc != SQLITE_OK) {
             sqlite3_free(err);
-            co_return unexpected(std::error_code(rc, std::generic_category()));
+            co_return unexpected(db_error(DbError::TransactionFailed));
         }
         state_ = ConnectionState::Transaction;
         co_return std::make_unique<SqliteTransaction>(db_, mx_);
@@ -416,7 +417,7 @@ public:
     Task<Result<std::unique_ptr<IConnection>>> acquire() override {
         if (!db_)
             co_return unexpected(
-                std::error_code(SQLITE_CANTOPEN, std::generic_category()));
+                db_error(DbError::ConnectionFailed));
         active_.fetch_add(1, std::memory_order_relaxed);
         co_return std::make_unique<SqliteConnection>(db_, mutex_);
     }
@@ -459,7 +460,7 @@ public:
         auto p = std::make_unique<SqliteConnectionPool>(path);
         if (!p->is_valid())
             co_return unexpected(
-                std::error_code(SQLITE_CANTOPEN, std::generic_category()));
+                db_error(DbError::ConnectionFailed));
         co_return p;
     }
 };

@@ -1,4 +1,5 @@
 #include "mysql_driver.hpp"
+#include "db_error.hpp"
 
 #include <mysql/mysql.h>
 #include <qbuem/core/task.hpp>
@@ -20,20 +21,6 @@ using namespace qbuem::db;
 
 namespace qbuem_routine {
 namespace {
-
-// ─── 에러 헬퍼 ───────────────────────────────────────────────────────────────
-
-struct MysqlErrorCategory : std::error_category {
-    const char* name() const noexcept override { return "mysql"; }
-    std::string message(int code) const override {
-        return std::format("mysql error: {}", code);
-    }
-};
-
-inline std::error_code mysql_error_code(unsigned int code = 1) {
-    static MysqlErrorCategory cat;
-    return {static_cast<int>(code), cat};
-}
 
 // ─── DSN 파서 ────────────────────────────────────────────────────────────────
 
@@ -280,13 +267,12 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
 
     MYSQL_STMT* stmt = mysql_stmt_init(conn);
     if (!stmt)
-        return unexpected(mysql_error_code(mysql_errno(conn)));
+        return unexpected(db_error(DbError::QueryFailed));
 
     if (mysql_stmt_prepare(stmt, converted.c_str(),
                            static_cast<unsigned long>(converted.size()))) {
-        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
-        return unexpected(mysql_error_code(err));
+        return unexpected(db_error(DbError::QueryFailed));
     }
 
     // 파라미터 바인딩 — 각 파라미터에 독립적인 숫자 버퍼 할당
@@ -334,15 +320,13 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     }
 
     if (!params.empty() && mysql_stmt_bind_param(stmt, binds.data())) {
-        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
-        return unexpected(mysql_error_code(err));
+        return unexpected(db_error(DbError::QueryFailed));
     }
 
     if (mysql_stmt_execute(stmt)) {
-        const unsigned int err = mysql_stmt_errno(stmt);
         mysql_stmt_close(stmt);
-        return unexpected(mysql_error_code(err));
+        return unexpected(db_error(DbError::QueryFailed));
     }
 
     const uint64_t affected = static_cast<uint64_t>(mysql_stmt_affected_rows(stmt));
@@ -388,13 +372,13 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     if (mysql_stmt_bind_result(stmt, res_binds.data())) {
         mysql_free_result(meta);
         mysql_stmt_close(stmt);
-        return unexpected(mysql_error_code(mysql_stmt_errno(stmt)));
+        return unexpected(db_error(DbError::QueryFailed));
     }
 
     if (mysql_stmt_store_result(stmt)) {
         mysql_free_result(meta);
         mysql_stmt_close(stmt);
-        return unexpected(mysql_error_code(mysql_stmt_errno(stmt)));
+        return unexpected(db_error(DbError::QueryFailed));
     }
 
     std::vector<std::vector<CellData>> rows;
@@ -488,7 +472,7 @@ public:
 private:
     Result<void> exec_sql(const std::string& sql) {
         if (mysql_query(db_, sql.c_str()))
-            return unexpected(mysql_error_code(mysql_errno(db_)));
+            return unexpected(db_error(DbError::TransactionFailed));
         return {};
     }
 
@@ -533,7 +517,7 @@ public:
                 + std::string(kLevel[li < 4 ? li : 1]);
             mysql_query(db_, set_sql.c_str());
             if (mysql_query(db_, "START TRANSACTION"))
-                co_return unexpected(mysql_error_code(mysql_errno(db_)));
+                co_return unexpected(db_error(DbError::TransactionFailed));
         }
         state_ = ConnectionState::Transaction;
         co_return std::make_unique<MysqlTransaction>(db_, mx_);
@@ -615,7 +599,7 @@ public:
                 MYSQL* fresh = create_connection(dsn_);
                 if (!fresh) {
                     lock.lock(); idle_.push(idx);
-                    co_return unexpected(mysql_error_code(2003));
+                    co_return unexpected(db_error(DbError::ConnectionFailed));
                 }
                 mysql_close(slot->conn);
                 slot->conn = fresh;
@@ -634,7 +618,7 @@ public:
             MYSQL* c = create_connection(dsn_);
             if (!c) {
                 lock.lock(); slots_.pop_back();
-                co_return unexpected(mysql_error_code(2003));
+                co_return unexpected(db_error(DbError::ConnectionFailed));
             }
             auto slot = std::make_unique<MysqlSlot>(c);
             MysqlSlot* raw_slot = slot.get();
@@ -647,7 +631,7 @@ public:
         }
 
         // 3. 풀 소진 → 즉시 에러 (동기 드라이버)
-        co_return unexpected(mysql_error_code(2003)); // CR_CONN_HOST_ERROR
+        co_return unexpected(db_error(DbError::PoolExhausted));
     }
 
     void release(size_t idx) noexcept {
@@ -710,7 +694,7 @@ public:
         auto p = std::make_unique<MysqlConnectionPool>(std::move(parsed),
                                                         std::move(config));
         if (!p->is_valid())
-            co_return unexpected(mysql_error_code(2003));
+            co_return unexpected(db_error(DbError::ConnectionFailed));
         co_return p;
     }
 };
