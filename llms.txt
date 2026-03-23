@@ -86,7 +86,13 @@ PgAcquireAwaiter: 풀 소진 yield → release() 시 waiter에게 슬롯 전달.
 순수 POSIX TCP + RESP2 프로토콜 구현. 외부 의존성 없음.
 RedisWriteAwaiter: non-blocking write, 미완 시 writable 이벤트 yield.
 RedisReadAwaiter: RespParser가 완성된 응답을 가질 때까지 readable 이벤트 yield.
-지원 명령: 문자열(GET/SET/SETNX/DEL/MGET/INCR 등) · 해시 · 리스트 · 셋 · 정렬셋 · 기타.
+지원 명령:
+문자열: GET/SET(TTL)/GETSET/SETNX/DEL/EXISTS/EXPIRE/TTL/PTTL/INCR/INCRBY/DECR/DECRBY/MGET/MSET
+해시:   HGET/HSET/HSETNX/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN
+리스트: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX
+셋:    SADD/SREM/SMEMBERS/SCARD/SISMEMBER
+정렬셋: ZADD/ZREM/ZRANGE/ZRANGEBYSCORE/ZSCORE/ZCARD/ZRANK
+기타:  TYPE/KEYS/SCAN/RENAME/PERSIST/PING/FLUSHDB/INFO + command(args)
 
 ## MySQL 드라이버 구조
 

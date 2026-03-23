@@ -312,6 +312,8 @@ auto& redis = **client_r;
 co_await redis.set("key", "value", 3600);   // EX 1시간
 auto val = co_await redis.get("key");        // RedisValue{String, "value"}
 auto cnt = co_await redis.incr("counter");   // int64_t
+auto ttl = co_await redis.ttl("key");        // int64_t (초)
+auto many = co_await redis.mget({"k1", "k2"}); // vector<optional<string>>
 
 // 해시
 co_await redis.hset("user:1", "name", "Alice");
@@ -333,6 +335,17 @@ auto rank = co_await redis.zrank("leaderboard", "alice");
 // 임의 명령
 auto r = co_await redis.command({"CONFIG", "GET", "maxmemory"});
 ```
+
+### 지원 명령 전체
+
+| 분류 | 명령 |
+|------|------|
+| 문자열 | GET · SET(TTL) · GETSET · SETNX · DEL · EXISTS · EXPIRE · TTL · PTTL · INCR · INCRBY · DECR · DECRBY · MGET · MSET |
+| 해시 | HGET · HSET · HSETNX · HDEL · HEXISTS · HGETALL · HKEYS · HVALS · HLEN |
+| 리스트 | LPUSH · RPUSH · LPOP · RPOP · LRANGE · LLEN · LINDEX |
+| 셋 | SADD · SREM · SMEMBERS · SCARD · SISMEMBER |
+| 정렬 셋 | ZADD · ZREM · ZRANGE · ZRANGEBYSCORE · ZSCORE · ZCARD · ZRANK |
+| 기타 | TYPE · KEYS · SCAN · RENAME · PERSIST · PING · FLUSHDB · INFO · command(args) |
 
 ---
 
