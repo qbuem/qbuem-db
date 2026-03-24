@@ -79,9 +79,9 @@ ExternalProject_Add(libpq_build
             # which is rejected in C23.  Force C17 for the libpq build.
             "CFLAGS=-std=gnu17 -O2"
     BUILD_COMMAND
-        ${MAKE_EXECUTABLE} -C <SOURCE_DIR>/src/interfaces/libpq
+        ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/interfaces/libpq
     INSTALL_COMMAND
-        ${MAKE_EXECUTABLE} -C <SOURCE_DIR>/src/interfaces/libpq install
+        ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/interfaces/libpq install
         COMMAND ${CMAKE_COMMAND} -E copy
             <SOURCE_DIR>/src/include/postgres_ext.h
             <INSTALL_DIR>/include/postgres_ext.h
@@ -109,6 +109,10 @@ target_link_libraries(qbuem_db_postgresql PUBLIC
     qbuem-stack::reactor
     qbuem-stack::result
 )
+# ExternalProject_Add는 imported target의 INTERFACE_INCLUDE_DIRECTORIES만으로는
+# 빌드 순서를 보장하지 않음. add_dependencies로 libpq.a 설치 완료 후
+# postgresql_driver.cpp가 컴파일되도록 명시적 의존성 선언.
+add_dependencies(qbuem_db_postgresql libpq_build)
 add_library(qbuem-db::postgresql_driver ALIAS qbuem_db_postgresql)
 
 # ── MySQL / MariaDB driver ────────────────────────────────────────────────────
