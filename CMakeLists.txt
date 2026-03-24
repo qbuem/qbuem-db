@@ -85,6 +85,9 @@ ExternalProject_Add(libpq_build
         COMMAND ${CMAKE_COMMAND} -E copy
             <SOURCE_DIR>/src/include/postgres_ext.h
             <INSTALL_DIR>/include/postgres_ext.h
+        COMMAND ${CMAKE_COMMAND} -E copy
+            <SOURCE_DIR>/src/include/pg_config_ext.h
+            <INSTALL_DIR>/include/pg_config_ext.h
     BUILD_BYPRODUCTS
         "${_PG_INST}/lib/libpq.a"
 )
