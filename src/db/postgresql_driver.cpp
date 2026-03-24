@@ -200,7 +200,7 @@ struct PgParams {
                     s.reserve(2 + bv.size() * 2);
                     s = "\\x";
                     for (auto b : bv) {
-                        const uint8_t byte = std::to_integer<uint8_t>(b);
+                        const uint8_t byte = static_cast<uint8_t>(b);
                         s += kHex[(byte >> 4) & 0xF];
                         s += kHex[byte & 0xF];
                     }
@@ -243,7 +243,7 @@ public:
             case Value::Type::Bool:    return static_cast<bool>(c.i64);
             case Value::Type::Text:    return std::string_view{c.text};
             case Value::Type::Blob:
-                return BufferView{reinterpret_cast<const std::byte*>(c.text.data()),
+                return BufferView{reinterpret_cast<const unsigned char*>(c.text.data()),
                                   c.text.size()};
         }
         return null;
@@ -470,7 +470,7 @@ struct Slot {
 
 class PgConnectionPool; // 전방 선언
 
-class PgConnection final : public IConnection; // 전방 선언 (불필요 — 아래 정의)
+class PgConnection; // forward declaration
 
 struct PgAcquireAwaiter {
     PgConnectionPool*                     pool;

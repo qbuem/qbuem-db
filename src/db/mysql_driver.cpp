@@ -176,7 +176,7 @@ public:
             case Value::Type::Bool:    return static_cast<bool>(c.i64);
             case Value::Type::Text:    return std::string_view{c.text};
             case Value::Type::Blob:
-                return BufferView{reinterpret_cast<const std::byte*>(c.text.data()),
+                return BufferView{reinterpret_cast<const unsigned char*>(c.text.data()),
                                   c.text.size()};
         }
         return null;
