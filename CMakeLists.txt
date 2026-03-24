@@ -8,6 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(FetchContent)
 include(ExternalProject)
 
+# PostgreSQL uses an autoconf/make build — it does not use the outer CMake
+# generator.  Always build it with make regardless of CMAKE_MAKE_PROGRAM.
+find_program(MAKE_EXECUTABLE NAMES make gmake REQUIRED)
+
 # ── 옵션 ──────────────────────────────────────────────────────────────────────
 option(QBUEM_DB_MYSQL   "MySQL/MariaDB 드라이버 빌드" ON)
 option(QBUEM_DB_REDIS   "Redis 클라이언트 빌드"       ON)
@@ -71,9 +75,9 @@ ExternalProject_Add(libpq_build
             --without-openssl
             --disable-nls
     BUILD_COMMAND
-        ${CMAKE_MAKE_PROGRAM} -C <SOURCE_DIR>/src/interfaces/libpq
+        ${MAKE_EXECUTABLE} -C <SOURCE_DIR>/src/interfaces/libpq
     INSTALL_COMMAND
-        ${CMAKE_MAKE_PROGRAM} -C <SOURCE_DIR>/src/interfaces/libpq install
+        ${MAKE_EXECUTABLE} -C <SOURCE_DIR>/src/interfaces/libpq install
     BUILD_BYPRODUCTS
         "${_PG_INST}/lib/libpq.a"
 )
