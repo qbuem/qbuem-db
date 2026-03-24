@@ -204,13 +204,13 @@ public:
                                                   std::string_view order_col,
                                                   int p = 1,
                                                   SortOrder order = SortOrder::Asc) const {
-        return sql_select_where(col, p) + " ORDER BY " + std::string(order_col) + sort_dir(order);
+        return sql_select_where(col, p) + " ORDER BY " + std::string(order_col) + std::string{sort_dir(order)};
     }
 
     /// SELECT ... FROM table ORDER BY order_col [ASC|DESC]
     [[nodiscard]] std::string sql_select_all_ordered(std::string_view order_col,
                                                       SortOrder order = SortOrder::Asc) const {
-        return cache_.sql_select_all + " ORDER BY " + std::string(order_col) + sort_dir(order);
+        return cache_.sql_select_all + " ORDER BY " + std::string(order_col) + std::string{sort_dir(order)};
     }
 
     /// SELECT ... FROM table WHERE raw_where
