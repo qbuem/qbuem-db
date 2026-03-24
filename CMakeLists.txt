@@ -46,7 +46,7 @@ set_target_properties(sqlite3 PROPERTIES LINKER_LANGUAGE C)
 
 # ── SQLite3 driver ────────────────────────────────────────────────────────────
 add_library(qbuem_db_sqlite3 STATIC
-    src/db/sqlite3_driver.cpp
+    src/qbuem/db/sqlite3_driver.cpp
 )
 target_include_directories(qbuem_db_sqlite3 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qbuem_db_sqlite3 PUBLIC
@@ -101,7 +101,7 @@ add_dependencies(PostgreSQL::PostgreSQL libpq_build)
 
 # ── PostgreSQL driver ─────────────────────────────────────────────────────────
 add_library(qbuem_db_postgresql STATIC
-    src/db/postgresql_driver.cpp
+    src/qbuem/db/postgresql_driver.cpp
 )
 target_include_directories(qbuem_db_postgresql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qbuem_db_postgresql PUBLIC
@@ -139,7 +139,7 @@ if(QBUEM_DB_MYSQL)
         )
 
         add_library(qbuem_db_mysql STATIC
-            src/db/mysql_driver.cpp
+            src/qbuem/db/mysql_driver.cpp
         )
         target_include_directories(qbuem_db_mysql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(qbuem_db_mysql PUBLIC
@@ -160,7 +160,7 @@ endif()
 # ── Redis client ──────────────────────────────────────────────────────────────
 if(QBUEM_DB_REDIS)
     add_library(qbuem_db_redis STATIC
-        src/db/redis_client.cpp
+        src/qbuem/db/redis_client.cpp
     )
     target_include_directories(qbuem_db_redis PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(qbuem_db_redis PUBLIC
