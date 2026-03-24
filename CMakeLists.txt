@@ -74,6 +74,10 @@ ExternalProject_Add(libpq_build
             --without-icu
             --without-openssl
             --disable-nls
+            # GCC 15+ defaults to -std=gnu23 where 'bool' is a keyword.
+            # PostgreSQL 17.x c.h still uses 'typedef unsigned char bool'
+            # which is rejected in C23.  Force C17 for the libpq build.
+            "CFLAGS=-std=gnu17 -O2"
     BUILD_COMMAND
         ${MAKE_EXECUTABLE} -C <SOURCE_DIR>/src/interfaces/libpq
     INSTALL_COMMAND
