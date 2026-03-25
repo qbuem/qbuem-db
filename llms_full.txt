@@ -1,32 +1,39 @@
-# qbuem-db v2.0 — Full Source Reference
-> 전체 소스 파일 요약 (LLM 컨텍스트용)
+# qbuem-db — Full Source Reference
+> Complete source file summary (LLM context)
 
 ---
 
-## 프로젝트 개요
+## Project Overview
 
-C++23 기반 DB 드라이버 라이브러리. qbuem-stack 위에서 동작.
-비동기 ORM + 4개 드라이버(PostgreSQL·MySQL·SQLite3·Redis) + 마이그레이션 툴.
+C++23 DB driver library built on qbuem-stack.
+Async ORM + 4 drivers (PostgreSQL · MySQL · SQLite3 · Redis) + migration tool.
 
 ---
 
-## src/db/orm.hpp — 헤더 전용 ORM (드라이버 독립)
+## src/db/orm.hpp — Header-Only ORM (Driver-Independent)
 
-C++23 Concepts 기반. TableMeta<T>에 SQL 생성 + 바인딩 + 읽기 메서드.
-Dialect 설정으로 모든 드라이버 호환.
+C++23 Concepts-based. `TableMeta<T>` provides SQL generation + binding + reading methods.
+Dialect setting enables compatibility with all drivers.
 
 ### Dialect
-enum class Dialect { PostgreSQL(기본/$N/RETURNING), MySQL(?/RETURNING없음/ON DUPLICATE KEY), SQLite(?/RETURNING없음/ON CONFLICT EXCLUDED) }
-TableMeta<T>& dialect(Dialect d)  — 빌더에서 설정
+```
+enum class Dialect {
+    PostgreSQL  (default / $N placeholders / RETURNING)
+    MySQL       (? placeholders / no RETURNING / ON DUPLICATE KEY)
+    SQLite      (? placeholders / no RETURNING / ON CONFLICT EXCLUDED)
+}
+TableMeta<T>& dialect(Dialect d)  — set in builder chain
+```
 
-### 지원 타입 Concepts
-- OrmInt:      int16_t / int32_t / int64_t / uint32_t
-- OrmFloat:    double / float
-- OrmText:     std::string
-- OrmBool:     bool
-- OrmOptional: std::optional<OrmScalar>
+### Supported Type Concepts
+- `OrmInt`:      `int16_t` / `int32_t` / `int64_t` / `uint32_t`
+- `OrmFloat`:    `double` / `float`
+- `OrmText`:     `std::string`
+- `OrmBool`:     `bool`
+- `OrmOptional`: `std::optional<OrmScalar>`
 
-### TableMeta<T> SQL 생성 메서드 (전체)
+### TableMeta<T> SQL Generation Methods (complete)
+```
 sql_select_all()                                    SELECT col1,… FROM table
 sql_select_where(col, p=1)                          SELECT … WHERE col=$p / ?
 sql_select_ordered(col, order_col, p, sort)         WHERE col=$p ORDER BY order_col [ASC|DESC]
@@ -55,140 +62,155 @@ sql_update_col_pk(col, returning=true)              UPDATE … SET col=$1 WHERE 
 sql_delete_pk()                                     DELETE … WHERE pk=$1
 sql_delete_where(col)                               DELETE … WHERE col=$1
 sql_delete_where2(c1, c2)                           DELETE … WHERE c1=$1 AND c2=$2
+```
 
-### TableMeta<T> 바인딩 메서드
-bind_insert(obj)                → vector<Value>  PK 제외
-bind_update(obj)                → vector<Value>  non-PK + PK 마지막
-bind_batch(span<T>)             → vector<Value>  배치 INSERT용 flat
-bind_pk(obj)                    → vector<Value>  PK만
-bind_val(v)                     → vector<Value>  단일 값
-bind_val2(v1, v2)               → vector<Value>  2개
-bind_val3(v1, v2, v3)           → vector<Value>  3개
+### TableMeta<T> Binding Methods
+```
+bind_insert(obj)                → vector<Value>  excludes PK
+bind_update(obj)                → vector<Value>  non-PK first, PK last
+bind_batch(span<T>)             → vector<Value>  flat params for batch INSERT
+bind_pk(obj)                    → vector<Value>  PK only
+bind_val(v)                     → vector<Value>  single value
+bind_val2(v1, v2)               → vector<Value>  2 values
+bind_val3(v1, v2, v3)           → vector<Value>  3 values
 bind_paged(where_val, lim, off) → vector<Value>  WHERE+LIMIT+OFFSET
-bind_in(range<OrmScalar>)       → vector<Value>  IN 절용 (vector/span/init-list)
+bind_in(range<OrmScalar>)       → vector<Value>  IN clause (vector/span/init-list)
+```
 
-### 전역 함수
-orm::register_table<T>(name) → TableMeta<T>&   등록 + 빌더 반환
-orm::meta<T>()               → const TableMeta<T>&  등록된 메타 접근
+### Global Functions
+```
+orm::register_table<T>(name) → TableMeta<T>&        register + return builder
+orm::meta<T>()               → const TableMeta<T>&  access registered meta
 orm::is_registered<T>()      → bool
+```
 
 ---
 
-## src/db/postgresql_driver.hpp/cpp — 비동기 PostgreSQL
+## src/db/postgresql_driver.hpp/cpp — Async PostgreSQL
 
-팩토리: make_postgresql_driver() → unique_ptr<IDBDriver>
-DSN: postgresql://user:pass@host:port/db  /  postgresql:///db (Unix socket)
+Factory: `make_postgresql_driver()` → `unique_ptr<IDBDriver>`
+DSN: `postgresql://user:pass@host:port/db` / `postgresql:///db` (Unix socket)
 
-### 아키텍처
+### Architecture
+```
 PgDriver → PgConnectionPool → Slot{PGconn*, mutex, stmt_counter}
 PgConnection / PgTransaction / PgStatement / PgRow / PgResultSet
+```
 
-### 비동기 Awaiter
-PgFlushAwaiter: PQflush()==1 시 writable 이벤트 yield
-PgReadAwaiter:  PQisBusy==true 시 readable 이벤트 yield, Reactor::post(resume)
-PgAcquireAwaiter: 풀 소진 yield → release() 시 슬롯 직접 전달
+### Async Awaiters
+- `PgFlushAwaiter`: yields on `PQflush()==1` until socket is writable
+- `PgReadAwaiter`:  yields on `PQisBusy==true` until socket is readable; resumes via `Reactor::post(resume)`
+- `PgAcquireAwaiter`: yields when pool is exhausted; slot handed directly on `release()`
 
-### 풀 동작
-1. idle 슬롯 → O(1) 반환
-2. slots < max_size → 새 PGconn 생성
-3. 풀 소진 → PgAcquireAwaiter yield
+### Pool Behavior
+1. Idle slot → O(1) return
+2. slots < max_size → create new PGconn
+3. Pool exhausted → `PgAcquireAwaiter` yield
 
-### 바이너리 프로토콜 (resultFormat=1)
+### Binary Protocol (resultFormat=1)
 OID 16(bool)→Bool, 20/21/23(int)→Int64, 700/701(float)→Float64,
-17(bytea)→Blob, others→Text. std::byteswap(C++23) big-endian 역직렬화.
+17(bytea)→Blob, others→Text. Big-endian deserialization via `std::byteswap` (C++23).
 
 ---
 
 ## src/db/sqlite3_driver.hpp/cpp — SQLite3
 
-팩토리: make_sqlite_driver() → unique_ptr<IDBDriver>
-DSN: sqlite:///path  /  sqlite://:memory:
+Factory: `make_sqlite_driver()` → `unique_ptr<IDBDriver>`
+DSN: `sqlite:///path` / `sqlite://:memory:`
 
-단일 sqlite3* + FULLMUTEX + WAL + synchronous=NORMAL + foreign_keys=ON.
-SqliteDriver / SqliteConnectionPool / SqliteConnection / SqliteTransaction /
-SqliteStatement / SqliteResultSet / SqliteRow.
+Single `sqlite3*` + FULLMUTEX + WAL + `synchronous=NORMAL` + `foreign_keys=ON`.
+`SqliteDriver` / `SqliteConnectionPool` / `SqliteConnection` / `SqliteTransaction` /
+`SqliteStatement` / `SqliteResultSet` / `SqliteRow`.
 
 ---
 
 ## src/db/mysql_driver.hpp/cpp — MySQL/MariaDB
 
-팩토리: make_mysql_driver() → unique_ptr<IDBDriver>
-DSN: mysql://user:pass@host:port/db[?ssl=true]  /  mariadb://…
+Factory: `make_mysql_driver()` → `unique_ptr<IDBDriver>`
+DSN: `mysql://user:pass@host:port/db[?ssl=true]` / `mariadb://…`
 
-### 특징
-- $N → ? 플레이스홀더 변환 (convert_placeholders)
-- libmysqlclient + MYSQL_STMT prepared statement
-- 멀티 커넥션 풀 (MysqlSlot{MYSQL*, mutex} per connection)
-- UTF8MB4 문자셋, TLS/SSL, MYSQL_OPT_RECONNECT
-- MysqlDriver / MysqlConnectionPool / MysqlConnection /
-  MysqlTransaction / MysqlStatement / MysqlRow / MysqlResultSet
+### Features
+- `$N` → `?` placeholder conversion (`convert_placeholders`)
+- libmysqlclient + `MYSQL_STMT` prepared statements
+- Multi-connection pool (`MysqlSlot{MYSQL*, mutex}` per connection)
+- UTF8MB4 charset, TLS/SSL, `MYSQL_OPT_RECONNECT`
+- `MysqlDriver` / `MysqlConnectionPool` / `MysqlConnection` /
+  `MysqlTransaction` / `MysqlStatement` / `MysqlRow` / `MysqlResultSet`
 
-### 클라우드 호환
+### Cloud Compatibility
 RDS MySQL · Aurora MySQL · Cloud SQL · Azure DB for MySQL ·
 PlanetScale · TiDB Cloud · MariaDB SkySQL
 
 ---
 
-## src/db/redis_client.hpp/cpp — Redis 비동기 클라이언트
+## src/db/redis_client.hpp/cpp — Async Redis Client
 
-DSN: redis://[:pass@]host[:port][/db]
-순수 POSIX TCP + RESP2. 외부 의존성 없음. qbuem Reactor 완전 통합.
+DSN: `redis://[:pass@]host[:port][/db]`
+Pure POSIX TCP + RESP2. No external dependencies. Fully integrated with qbuem Reactor.
 
-### 구조
-RedisDsn 파서 → connect_tcp → RedisConnectAwaiter
+### Architecture
+```
+RedisDsn parser → connect_tcp → RedisConnectAwaiter
 RedisClientImpl{fd, RespParser}
-RedisWriteAwaiter: non-blocking write + writable 이벤트
-RedisReadAwaiter:  RespParser 완성까지 readable 이벤트
-RespParser: RESP2 스트리밍 파서 (has_complete + parse)
+RedisWriteAwaiter: non-blocking write + writable event
+RedisReadAwaiter:  readable event until RespParser has complete response
+RespParser: RESP2 streaming parser (has_complete + parse)
+```
 
-### 지원 명령
-문자열: GET/SET(TTL)/GETSET/SETNX/DEL/EXISTS/EXPIRE/TTL/PTTL/INCR/INCRBY/DECR/DECRBY/MGET/MSET
-해시:   HGET/HSET/HSETNX/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN
-리스트: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX
-셋:    SADD/SREM/SMEMBERS/SCARD/SISMEMBER
-정렬셋: ZADD/ZREM/ZRANGE/ZRANGEBYSCORE/ZSCORE/ZCARD/ZRANK
-기타:  TYPE/KEYS/SCAN/RENAME/PERSIST/PING/FLUSHDB/INFO + command(args)
+### Supported Commands
+```
+Strings:     GET/SET(TTL)/GETSET/SETNX/DEL/EXISTS/EXPIRE/TTL/PTTL/INCR/INCRBY/DECR/DECRBY/MGET/MSET
+Hash:        HGET/HSET/HSETNX/HDEL/HEXISTS/HGETALL/HKEYS/HVALS/HLEN
+List:        LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX
+Set:         SADD/SREM/SMEMBERS/SCARD/SISMEMBER
+Sorted Set:  ZADD/ZREM/ZRANGE/ZRANGEBYSCORE/ZSCORE/ZCARD/ZRANK
+Other:       TYPE/KEYS/SCAN/RENAME/PERSIST/PING/FLUSHDB/INFO + command(args)
+```
 
-### 클라우드 호환
+### Cloud Compatibility
 ElastiCache · Upstash · Redis Cloud · Memorystore · Azure Cache
 
 ---
 
-## src/db/migration/migrator.hpp — 마이그레이션 프레임워크
+## src/db/migration/migrator.hpp — Migration Framework
 
-헤더 전용. IConnection 인터페이스 위에서 동작. 드라이버 독립.
+Header-only. Operates on the `IConnection` interface. Driver-independent.
 
-### 구조체
+### Structs
+```
 Migration{version, description, up, down}
 MigrationStatus{version, description, applied, applied_at}
 MigrationResult{applied, skipped, latest}
 PlaceholderStyle{Dollar($N), Question(?)}
+```
 
 ### MigrationRunner API
+```
 MigrationRunner(migrations, conn, style=Dollar)
-migrate()            → MigrationResult   미적용 전부
-migrate_to(ver)      → MigrationResult   특정 버전까지
-rollback()           → void              최신 1개 롤백
-rollback_to(ver)     → void              버전 초과분 전부 롤백
-status()             → vector<MigrationStatus>  현황
+migrate()            → MigrationResult   apply all pending
+migrate_to(ver)      → MigrationResult   apply up to version
+rollback()           → void              roll back latest one
+rollback_to(ver)     → void              roll back all above version
+status()             → vector<MigrationStatus>
 is_applied(ver)      → bool
 current_version()    → uint64_t
+```
 
-이력: __schema_migrations{version BIGINT PK, description TEXT, applied_at TIMESTAMP}
-세미콜론 구분 다중 SQL (split_sql), 트랜잭션 내 원자 적용.
+History table: `__schema_migrations{version BIGINT PK, description TEXT, applied_at TIMESTAMP}`
+Multi-statement SQL via semicolon splitting (`split_sql`). Atomic application within a transaction.
 
 ---
 
 ## CMakeLists.txt
 
 cmake 3.20+, C++23.
-FetchContent: qbuem_stack(GIT), sqlite3_amalgam(ZIP 3.49.1)
-ExternalProject: libpq 17.2 소스 빌드
-find_library: MySQL (선택, QBUEM_DB_MYSQL=ON/OFF)
-옵션: QBUEM_DB_MYSQL(ON), QBUEM_DB_REDIS(ON)
+FetchContent: qbuem_stack (GIT), sqlite3_amalgam (ZIP 3.49.1)
+ExternalProject: libpq 17.2 source build
+find_library: MySQL (optional, QBUEM_DB_MYSQL=ON/OFF)
+Options: `QBUEM_DB_MYSQL` (ON), `QBUEM_DB_REDIS` (ON)
 
-타겟: qbuem_db_orm(INTERFACE), qbuem_db_migration(INTERFACE),
-      qbuem_db_sqlite3(STATIC), qbuem_db_postgresql(STATIC),
-      qbuem_db_mysql(STATIC, 조건부), qbuem_db_redis(STATIC, 조건부)
-alias: qbuem-db::orm, qbuem-db::migration, qbuem-db::sqlite3_driver,
-       qbuem-db::postgresql_driver, qbuem-db::mysql_driver, qbuem-db::redis_client
+Targets: `qbuem_db_orm` (INTERFACE), `qbuem_db_migration` (INTERFACE),
+         `qbuem_db_sqlite3` (STATIC), `qbuem_db_postgresql` (STATIC),
+         `qbuem_db_mysql` (STATIC, conditional), `qbuem_db_redis` (STATIC, conditional)
+Aliases: `qbuem-db::orm`, `qbuem-db::migration`, `qbuem-db::sqlite3_driver`,
+         `qbuem-db::postgresql_driver`, `qbuem-db::mysql_driver`, `qbuem-db::redis_client`
