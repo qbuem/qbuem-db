@@ -230,6 +230,9 @@ cmake --build build
 - **`sql_upsert_pk()` MySQL**: generates `ON DUPLICATE KEY UPDATE` not `ON CONFLICT` — dialect must be set correctly
 - **`bind_in(ids)`**: empty `ids` produces `WHERE col IN ()` → SQL error; check `empty()` before calling
 - **`sql_insert_batch(n)`**: asserts on n=0 or tables with no non-PK columns
+- **`SUM(BIGINT)` returns NUMERIC (OID 1700)**: PostgreSQL `SUM(bigint)` returns `NUMERIC`, not `BIGINT`. The binary driver only handles `OID_INT8` — NUMERIC falls through to `default:` and returns garbage bytes interpreted as int64_t. Always cast: `SUM(col)::BIGINT` when the column is BIGINT. (`SUM(integer)` → BIGINT is fine without cast.)
+- **ORM INSERT with TIMESTAMPTZ/DATE columns**: `to_value(std::string{""})` binds empty string as TEXT `''`. PostgreSQL rejects `''::timestamptz`. Use custom INSERT SQL with `NULLIF($N,'')::timestamptz` for nullable timestamp columns, and exclude `DEFAULT NOW()` columns entirely from the INSERT.
+- **Binary DATE/TIME format**: PostgreSQL binary format for DATE=int32 days since 2000-01-01, TIME=int64 µsec since midnight, TIMESTAMP/TIMESTAMPTZ=int64 µsec since 2000-01-01 UTC. These are now decoded in `read_pg_column_binary` (OID 1082/1083/1114/1184) as formatted strings.
 
 ---
 
@@ -259,3 +262,6 @@ If a temporary local workaround is necessary while waiting for an upstream fix, 
 ```cpp
 // TODO: remove after qbuem-db#NNN is merged
 ```
+
+> **Cross-repo development workflow and documentation update policy:**
+> See root workspace CLAUDE.md at `/Users/goodboy/Projects/qbuem/CLAUDE.md`.

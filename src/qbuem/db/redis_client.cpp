@@ -20,7 +20,7 @@ using namespace qbuem;
 
 namespace qbuem_routine::redis {
 
-// ── DSN 파서 ─────────────────────────────────────────────────────────────────
+// ── DSN parser ───────────────────────────────────────────────────────────────
 
 struct RedisDsn {
     std::string host{"127.0.0.1"};
@@ -65,7 +65,7 @@ static RedisDsn parse_dsn(std::string_view dsn) {
     return result;
 }
 
-// ── RESP2 인코더 ─────────────────────────────────────────────────────────────
+// ── RESP2 encoder ────────────────────────────────────────────────────────────
 
 static std::string encode_resp(const std::vector<std::string>& args) {
     std::string buf;
@@ -73,7 +73,7 @@ static std::string encode_resp(const std::vector<std::string>& args) {
     std::size_t total = 16;
     for (const auto& a : args) total += 8 + a.size();
     buf.reserve(total);
-    char tmp[24]; // to_chars 스택 버퍼 — std::to_string 임시 할당 없음
+    char tmp[24]; // to_chars stack buffer — avoids std::to_string temporary allocation
     buf += '*';
     auto [e1, _1] = std::to_chars(tmp, tmp + sizeof(tmp), args.size());
     buf.append(tmp, e1);
@@ -89,26 +89,26 @@ static std::string encode_resp(const std::vector<std::string>& args) {
     return buf;
 }
 
-// ── RESP2 파서 ───────────────────────────────────────────────────────────────
+// ── RESP2 parser ─────────────────────────────────────────────────────────────
 
 class RespParser {
 public:
-    /// 버퍼에 데이터 추가
+    /// Append data to the internal buffer.
     void feed(const char* data, size_t len) {
         buf_.append(data, len);
     }
 
-    /// 완전한 응답이 파싱 가능한지 확인
+    /// Returns true if a complete RESP response is available to parse.
     [[nodiscard]] bool has_complete() const {
         std::size_t pos = 0;
         return can_parse(pos);
     }
 
-    /// 응답 파싱 (has_complete() == true 이어야 함)
+    /// Parse and consume a complete response (has_complete() must be true).
     [[nodiscard]] RedisValue parse() {
         std::size_t pos = 0;
         auto val = parse_value(pos);
-        // 전체 소비 시 clear() O(1), 부분 소비 시만 erase() O(n)
+        // O(1) clear() when fully consumed; O(n) erase() only for partial consumption
         if (pos == buf_.size())
             buf_.clear();
         else
@@ -218,7 +218,7 @@ private:
     }
 };
 
-// ── Reactor 기반 비동기 Awaiter ──────────────────────────────────────────────
+// ── Reactor-based async awaiters ─────────────────────────────────────────────
 
 struct RedisReadAwaiter {
     int          fd;
@@ -227,7 +227,7 @@ struct RedisReadAwaiter {
     bool         error{false};
 
     bool await_ready() noexcept {
-        // 이미 버퍼에 완성된 응답이 있으면 즉시 반환
+        // return immediately if a complete response is already buffered
         return parser->has_complete();
     }
 
@@ -264,7 +264,7 @@ struct RedisWriteAwaiter {
     bool        error{false};
 
     bool await_ready() noexcept {
-        // 즉시 쓰기 시도
+        // attempt immediate write
         while (sent < data.size()) {
             const ssize_t n = ::write(fd, data.data() + sent, data.size() - sent);
             if (n > 0) { sent += static_cast<size_t>(n); continue; }
@@ -295,6 +295,75 @@ struct RedisWriteAwaiter {
     bool await_resume() noexcept { return !error && sent == data.size(); }
 };
 
+// ── Connection helpers ────────────────────────────────────────────────────────
+
+static int connect_tcp(const RedisDsn& dsn) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    const auto port_str = std::to_string(dsn.port);
+    if (::getaddrinfo(dsn.host.c_str(), port_str.c_str(), &hints, &res) != 0)
+        return -1;
+
+    int fd = -1;
+    for (auto* rp = res; rp; rp = rp->ai_next) {
+#ifdef __linux__
+        fd = ::socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                      rp->ai_protocol);
+#else
+        fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd >= 0) {
+            ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+            ::fcntl(fd, F_SETFD, ::fcntl(fd, F_GETFD) | FD_CLOEXEC);
+        }
+#endif
+        if (fd < 0) continue;
+
+        // TCP_NODELAY: minimize latency (Redis sends many small packets)
+        const int one = 1;
+        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+        const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (rc == 0 || errno == EINPROGRESS) break;
+        ::close(fd); fd = -1;
+    }
+    ::freeaddrinfo(res);
+    return fd;
+}
+
+struct RedisConnectAwaiter {
+    int fd;
+    bool ready{false};
+    bool error{false};
+
+    bool await_ready() noexcept {
+        // connect completes immediately for loopback connections
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+            ready = true;
+            return true;
+        }
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> h) noexcept {
+        auto* reactor = Reactor::current();
+        reactor->register_event(fd, EventType::Write,
+            [this, h, reactor](int) mutable {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                error = (err != 0);
+                reactor->unregister_event(fd, EventType::Write);
+                reactor->post([h]() mutable { h.resume(); });
+            });
+    }
+
+    bool await_resume() noexcept { return !error; }
+};
+
 // ── RedisClientImpl ───────────────────────────────────────────────────────────
 
 class RedisClientImpl {
@@ -307,7 +376,7 @@ public:
     RedisClientImpl(const RedisClientImpl&)            = delete;
     RedisClientImpl& operator=(const RedisClientImpl&) = delete;
 
-    // 연결 끊김 시 재연결 + AUTH + SELECT 재수행
+    // On connection drop: reconnect and re-run AUTH + SELECT
     Task<bool> reconnect() {
         close_fd();
         parser_ = RespParser{};
@@ -337,13 +406,13 @@ public:
         co_return true;
     }
 
-    // ConnectionFailed 시 재연결 후 1회 재시도
+    // On ConnectionFailed: reconnect then retry once
     Task<Result<RedisValue>> send(std::vector<std::string> args) {
         auto r = co_await send_once(args);
         if (r || r.error() != db_error(DbError::ConnectionFailed))
             co_return r;
 
-        // 재연결 후 재시도
+        // retry after reconnect
         if (!co_await reconnect())
             co_return unexpected(db_error(DbError::ConnectionFailed));
         co_return co_await send_once(std::move(args));
@@ -366,7 +435,7 @@ private:
     Task<Result<RedisValue>> send_once(std::vector<std::string> args) {
         auto encoded = encode_resp(args);
 
-        // 쓰기
+        // write
         RedisWriteAwaiter write_aw{fd_, std::move(encoded)};
         if (!write_aw.await_ready()) {
             if (!co_await write_aw)
@@ -375,7 +444,7 @@ private:
             co_return unexpected(db_error(DbError::ConnectionFailed));
         }
 
-        // 읽기
+        // read
         RedisReadAwaiter read_aw{fd_, &parser_};
         RedisValue val;
         if (read_aw.await_ready()) {
@@ -397,68 +466,7 @@ private:
     RespParser parser_;
 };
 
-// ── 연결 헬퍼 ─────────────────────────────────────────────────────────────────
-
-static int connect_tcp(const RedisDsn& dsn) {
-    struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    const auto port_str = std::to_string(dsn.port);
-    if (::getaddrinfo(dsn.host.c_str(), port_str.c_str(), &hints, &res) != 0)
-        return -1;
-
-    int fd = -1;
-    for (auto* rp = res; rp; rp = rp->ai_next) {
-        fd = ::socket(rp->ai_family, rp->ai_socktype | SOCK_NONBLOCK | SOCK_CLOEXEC,
-                      rp->ai_protocol);
-        if (fd < 0) continue;
-
-        // TCP_NODELAY: 레이턴시 최소화 (Redis는 작은 패킷 다수)
-        const int one = 1;
-        ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-        const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);
-        if (rc == 0 || errno == EINPROGRESS) break;
-        ::close(fd); fd = -1;
-    }
-    ::freeaddrinfo(res);
-    return fd;
-}
-
-struct RedisConnectAwaiter {
-    int fd;
-    bool ready{false};
-    bool error{false};
-
-    bool await_ready() noexcept {
-        // connect가 즉시 완료되는 경우 (localhost)
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
-            ready = true;
-            return true;
-        }
-        return false;
-    }
-
-    void await_suspend(std::coroutine_handle<> h) noexcept {
-        auto* reactor = Reactor::current();
-        reactor->register_event(fd, EventType::Write,
-            [this, h, reactor](int) mutable {
-                int err = 0;
-                socklen_t len = sizeof(err);
-                ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
-                error = (err != 0);
-                reactor->unregister_event(fd, EventType::Write);
-                reactor->post([h]() mutable { h.resume(); });
-            });
-    }
-
-    bool await_resume() noexcept { return !error; }
-};
-
-// ── RedisClient 구현 ──────────────────────────────────────────────────────────
+// ── RedisClient implementation ────────────────────────────────────────────────
 
 RedisClient::RedisClient(std::unique_ptr<RedisClientImpl> impl)
     : impl_(std::move(impl)) {}
@@ -476,7 +484,7 @@ RedisClient::connect(std::string_view dsn) {
     if (fd < 0)
         co_return unexpected(db_error(DbError::ConnectionFailed));
 
-    // 비동기 연결 완료 대기
+    // wait for async connect to complete
     RedisConnectAwaiter conn_aw{fd};
     if (!conn_aw.await_ready()) {
         if (!co_await conn_aw) {
@@ -488,7 +496,7 @@ RedisClient::connect(std::string_view dsn) {
     auto impl = std::make_unique<RedisClientImpl>(fd, parsed);
     auto client = std::make_unique<RedisClient>(std::move(impl));
 
-    // AUTH (비밀번호가 있을 때)
+    // AUTH (when a password is set)
     if (!parsed.password.empty()) {
         std::vector<std::string> auth_args;
         if (!parsed.username.empty()) {
@@ -511,12 +519,12 @@ RedisClient::connect(std::string_view dsn) {
     co_return client;
 }
 
-// ── 헬퍼 매크로 대체 ─────────────────────────────────────────────────────────
+// ── Helper macro shorthands ───────────────────────────────────────────────────
 
 #define RC_SEND(...) co_await impl_->send({__VA_ARGS__})
 #define RC_CHECK(r)  if (!(r)) co_return unexpected((r).error())
 
-// ── 명령 구현 ─────────────────────────────────────────────────────────────────
+// ── Command implementations ───────────────────────────────────────────────────
 
 Task<Result<RedisValue>> RedisClient::ping() {
     auto r = RC_SEND("PING");
@@ -611,7 +619,7 @@ RedisClient::mget(std::vector<std::string> keys) {
     co_return result;
 }
 
-// ── 해시 ─────────────────────────────────────────────────────────────────────
+// ── Hash commands ────────────────────────────────────────────────────────────
 
 Task<Result<std::optional<std::string>>>
 RedisClient::hget(std::string_view key, std::string_view field) {
@@ -666,7 +674,7 @@ Task<Result<int64_t>> RedisClient::hlen(std::string_view key) {
     co_return (*r).as_int();
 }
 
-// ── 리스트 ───────────────────────────────────────────────────────────────────
+// ── List commands ────────────────────────────────────────────────────────────
 
 Task<Result<int64_t>> RedisClient::lpush(std::string_view key, std::string_view value) {
     auto r = RC_SEND("LPUSH", std::string(key), std::string(value));
@@ -710,7 +718,7 @@ Task<Result<int64_t>> RedisClient::llen(std::string_view key) {
     co_return (*r).as_int();
 }
 
-// ── 셋 ───────────────────────────────────────────────────────────────────────
+// ── Set commands ─────────────────────────────────────────────────────────────
 
 Task<Result<int64_t>> RedisClient::sadd(std::string_view key, std::string_view member) {
     auto r = RC_SEND("SADD", std::string(key), std::string(member));
@@ -744,7 +752,7 @@ Task<Result<bool>> RedisClient::sismember(std::string_view key, std::string_view
     co_return (*r).as_int() == 1;
 }
 
-// ── 정렬 셋 ──────────────────────────────────────────────────────────────────
+// ── Sorted set commands ───────────────────────────────────────────────────────
 
 Task<Result<int64_t>>
 RedisClient::zadd(std::string_view key, double score, std::string_view member) {
@@ -795,7 +803,7 @@ RedisClient::zrank(std::string_view key, std::string_view member) {
     co_return (*r).as_int();
 }
 
-// ── 기타 ─────────────────────────────────────────────────────────────────────
+// ── Miscellaneous commands ────────────────────────────────────────────────────
 
 Task<Result<std::string>> RedisClient::type(std::string_view key) {
     auto r = RC_SEND("TYPE", std::string(key));

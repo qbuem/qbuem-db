@@ -12,9 +12,10 @@ include(ExternalProject)
 # generator.  Always build it with make regardless of CMAKE_MAKE_PROGRAM.
 find_program(MAKE_EXECUTABLE NAMES make gmake REQUIRED)
 
-# ── 옵션 ──────────────────────────────────────────────────────────────────────
-option(QBUEM_DB_MYSQL   "MySQL/MariaDB 드라이버 빌드" ON)
-option(QBUEM_DB_REDIS   "Redis 클라이언트 빌드"       ON)
+# ── Options ───────────────────────────────────────────────────────────────────
+option(QBUEM_DB_MYSQL   "Build MySQL/MariaDB driver"                        ON)
+option(QBUEM_DB_REDIS   "Build Redis client"                                ON)
+option(QBUEM_DB_PG_SSL  "Build libpq with OpenSSL (required for SSL/TLS)"   ON)
 
 # ── qbuem-stack ───────────────────────────────────────────────────────────────
 set(QBUEM_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
@@ -60,6 +61,24 @@ add_library(qbuem-db::sqlite3_driver ALIAS qbuem_db_sqlite3)
 set(_PG_VER  "17.2")
 set(_PG_INST "${CMAKE_BINARY_DIR}/_libpq_prefix")
 
+# OpenSSL: always try to find it (needed for SCRAM-SHA-256 / TLS on Neon/cloud
+# PostgreSQL). Fall back to no-SSL only when OpenSSL is genuinely unavailable.
+find_package(OpenSSL QUIET)
+if(OPENSSL_FOUND)
+    set(_PG_SSL_FLAG --with-openssl)
+    set(_PG_SSL_CPPFLAGS "CPPFLAGS=-I${OPENSSL_INCLUDE_DIR}")
+    # Pass OpenSSL lib dir so pg configure can find -lssl -lcrypto.
+    get_filename_component(_OPENSSL_LIB_DIR "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+    set(_PG_SSL_LDFLAGS "LDFLAGS=-L${_OPENSSL_LIB_DIR}")
+    message(STATUS "qbuem-db: libpq will be built with OpenSSL (${OPENSSL_SSL_LIBRARY})")
+else()
+    set(_PG_SSL_FLAG --without-openssl)
+    set(_PG_SSL_CPPFLAGS "")
+    set(_PG_SSL_LDFLAGS "")
+    message(WARNING "qbuem-db: OpenSSL not found — libpq built without TLS support. "
+                    "Cloud PostgreSQL (Neon, RDS, etc.) will refuse connections.")
+endif()
+
 ExternalProject_Add(libpq_build
     URL      "https://ftp.postgresql.org/pub/source/v${_PG_VER}/postgresql-${_PG_VER}.tar.bz2"
     SOURCE_DIR   "${CMAKE_BINARY_DIR}/_deps/postgresql-src"
@@ -72,16 +91,41 @@ ExternalProject_Add(libpq_build
             --without-readline
             --without-zlib
             --without-icu
-            --without-openssl
+            --without-ldap
+            ${_PG_SSL_FLAG}
             --disable-nls
             # GCC 15+ defaults to -std=gnu23 where 'bool' is a keyword.
             # PostgreSQL 17.x c.h still uses 'typedef unsigned char bool'
             # which is rejected in C23.  Force C17 for the libpq build.
             "CFLAGS=-std=gnu17 -O2"
+            ${_PG_SSL_CPPFLAGS}
+            ${_PG_SSL_LDFLAGS}
     BUILD_COMMAND
-        ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/interfaces/libpq
+        # Build generated headers first (errcodes.h etc.)
+        ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/include
+        # Build libpq and its companion archives (pgcommon, pgport contain
+        # SCRAM/HMAC/strong-random symbols required for SCRAM-SHA-256 auth).
+        COMMAND ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/interfaces/libpq libpq.a
+        COMMAND ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/common libpgcommon_shlib.a
+        COMMAND ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/port   libpgport_shlib.a
     INSTALL_COMMAND
-        ${MAKE_EXECUTABLE} -j -C <SOURCE_DIR>/src/interfaces/libpq install
+        ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/lib
+        COMMAND ${CMAKE_COMMAND} -E make_directory <INSTALL_DIR>/include
+        COMMAND ${CMAKE_COMMAND} -E copy
+            <SOURCE_DIR>/src/interfaces/libpq/libpq.a
+            <INSTALL_DIR>/lib/libpq.a
+        # Merge companion archives (provide pg_saslprep, pg_strong_random, etc.)
+        COMMAND ${CMAKE_COMMAND}
+            -DLIBPQ_A=<INSTALL_DIR>/lib/libpq.a
+            -DLIBPGPORT_A=<SOURCE_DIR>/src/port/libpgport_shlib.a
+            -DLIBPGCOMMON_A=<SOURCE_DIR>/src/common/libpgcommon_shlib.a
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/merge_libpq.cmake
+        COMMAND ${CMAKE_COMMAND} -E copy
+            <SOURCE_DIR>/src/interfaces/libpq/libpq-fe.h
+            <INSTALL_DIR>/include/libpq-fe.h
+        COMMAND ${CMAKE_COMMAND} -E copy
+            <SOURCE_DIR>/src/interfaces/libpq/libpq-events.h
+            <INSTALL_DIR>/include/libpq-events.h
         COMMAND ${CMAKE_COMMAND} -E copy
             <SOURCE_DIR>/src/include/postgres_ext.h
             <INSTALL_DIR>/include/postgres_ext.h
@@ -109,6 +153,9 @@ target_link_libraries(qbuem_db_postgresql PUBLIC
     qbuem-stack::reactor
     qbuem-stack::result
 )
+if(OPENSSL_FOUND)
+    target_link_libraries(qbuem_db_postgresql PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 # ExternalProject_Add는 imported target의 INTERFACE_INCLUDE_DIRECTORIES만으로는
 # 빌드 순서를 보장하지 않음. add_dependencies로 libpq.a 설치 완료 후
 # postgresql_driver.cpp가 컴파일되도록 명시적 의존성 선언.

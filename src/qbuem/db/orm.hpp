@@ -110,7 +110,11 @@ template<OrmScalar F>
 template<typename T>
 struct FieldDef {
     std::string  col;
-    bool         is_pk;
+    bool         is_pk       = false;
+    /// True for server-generated columns (created_at, updated_at).
+    /// Included in SELECT col list and read back via read_row(), but
+    /// excluded from INSERT / UPDATE / batch binding so the DB uses DEFAULT.
+    bool         is_readonly = false;
 
     std::function<Value(const T&)>        to_val;
     std::function<void(T&, const Value&)> from_val;
@@ -176,6 +180,27 @@ public:
 
         fields_.push_back(make_field<F>(std::move(col_name), ptr, false));
         ++non_pk_count_;
+        rebuild_stable_sqls();
+        return *this;
+    }
+
+    /// Register a server-default (read-only) column.
+    /// Included in SELECT col list so read_row() can populate it from RETURNING *.
+    /// Excluded from INSERT / UPDATE / batch SQL and bindings — the DB uses DEFAULT.
+    /// Typical use: created_at, updated_at (PostgreSQL DEFAULT NOW()).
+    template<OrmField F>
+    TableMeta& col_server_default(std::string col_name, F T::* ptr) {
+        // Add to col_list_all so SELECT * reads it back
+        if (!cache_.col_list_all.empty()) cache_.col_list_all += ", ";
+        cache_.col_list_all += col_name;
+
+        // NOT added to col_list_no_pk / placeholders_no_pk / upsert caches
+        // NOT counted in non_pk_count_
+
+        auto fd = make_field<F>(std::move(col_name), ptr, false);
+        fd.is_readonly = true;
+        fields_.push_back(std::move(fd));
+
         rebuild_stable_sqls();
         return *this;
     }
@@ -437,22 +462,22 @@ public:
 
     // ── 파라미터 바인딩 ───────────────────────────────────────────────────────
 
-    /// INSERT용: PK 제외, 등록 순서대로
+    // INSERT: non-PK, non-readonly fields only (registration order)
     [[nodiscard]] std::vector<Value> bind_insert(const T& v) const {
         std::vector<Value> params;
         params.reserve(non_pk_count_);
         for (const auto& f : fields_) {
-            if (!f.is_pk) params.push_back(f.to_val(v));
+            if (!f.is_pk && !f.is_readonly) params.push_back(f.to_val(v));
         }
         return params;
     }
 
-    /// UPDATE용: non-PK 먼저, PK 마지막
+    // UPDATE: non-PK, non-readonly fields first; PK last
     [[nodiscard]] std::vector<Value> bind_update(const T& v) const {
         std::vector<Value> params;
         params.reserve(fields_.size());
         for (const auto& f : fields_) {
-            if (!f.is_pk) params.push_back(f.to_val(v));
+            if (!f.is_pk && !f.is_readonly) params.push_back(f.to_val(v));
         }
         for (const auto& f : fields_) {
             if (f.is_pk) params.push_back(f.to_val(v));
@@ -460,14 +485,14 @@ public:
         return params;
     }
 
-    /// 배치 INSERT용: flat 바인딩 (non-PK만, 행 단위 순서)
+    // Batch INSERT: flat bindings (non-PK, non-readonly, row-major order)
     [[nodiscard]] std::vector<Value> bind_batch(std::span<const T> objects) const {
         assert(!objects.empty() && "bind_batch: objects must not be empty");
         std::vector<Value> params;
         params.reserve(objects.size() * non_pk_count_);
         for (const auto& obj : objects) {
             for (const auto& f : fields_) {
-                if (!f.is_pk) params.push_back(f.to_val(obj));
+                if (!f.is_pk && !f.is_readonly) params.push_back(f.to_val(obj));
             }
         }
         return params;
@@ -699,7 +724,7 @@ private:
         std::string set_clause;
         set_clause.reserve(cache_.col_list_no_pk.size() * 2);
         for (const auto& f : fields_) {
-            if (f.is_pk) continue;
+            if (f.is_pk || f.is_readonly) continue;
             if (!set_clause.empty()) set_clause += ", ";
             set_clause += f.col;
             set_clause += " = ";

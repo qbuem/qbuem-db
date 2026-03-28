@@ -13,6 +13,7 @@
 #include <chrono>
 #include <coroutine>
 #include <cstring>
+#include <format>
 #include <fcntl.h>    // fcntl, O_NONBLOCK
 #include <memory>
 #include <mutex>
@@ -26,17 +27,21 @@ using namespace qbuem::db;
 namespace qbuem_routine {
 namespace {
 
-// ─── PostgreSQL OID 상수 ──────────────────────────────────────────────────────
+// ─── PostgreSQL OID constants ────────────────────────────────────────────────
 
-static constexpr Oid OID_BOOL   = 16;
-static constexpr Oid OID_BYTEA  = 17;
-static constexpr Oid OID_INT8   = 20;
-static constexpr Oid OID_INT2   = 21;
-static constexpr Oid OID_INT4   = 23;
-static constexpr Oid OID_FLOAT4 = 700;
-static constexpr Oid OID_FLOAT8 = 701;
+static constexpr Oid OID_BOOL        = 16;
+static constexpr Oid OID_BYTEA       = 17;
+static constexpr Oid OID_INT8        = 20;
+static constexpr Oid OID_INT2        = 21;
+static constexpr Oid OID_INT4        = 23;
+static constexpr Oid OID_FLOAT4      = 700;
+static constexpr Oid OID_FLOAT8      = 701;
+static constexpr Oid OID_DATE        = 1082;
+static constexpr Oid OID_TIME        = 1083;
+static constexpr Oid OID_TIMESTAMP   = 1114;
+static constexpr Oid OID_TIMESTAMPTZ = 1184;
 
-// ─── 바이너리 big-endian 역직렬화 ─────────────────────────────────────────────
+// ─── Binary big-endian deserialization ───────────────────────────────────────
 
 template<std::integral T>
 static T from_be(const char* data) noexcept {
@@ -47,7 +52,53 @@ static T from_be(const char* data) noexcept {
     return v;
 }
 
-// ─── CellData ─────────────────────────────────────────────────────────────────
+// ─── PostgreSQL binary date/time conversion helpers ──────────────────────────
+
+// PostgreSQL binary epoch: days/microseconds since 2000-01-01
+static const std::chrono::sys_days kPgDateEpoch{
+    std::chrono::year{2000} / std::chrono::January / std::chrono::day{1}};
+
+static std::string pg_days_to_date_str(int32_t days) noexcept {
+    auto dp  = kPgDateEpoch + std::chrono::days{days};
+    auto ymd = std::chrono::year_month_day{dp};
+    return std::format("{:04d}-{:02d}-{:02d}",
+        static_cast<int>(ymd.year()),
+        static_cast<unsigned>(ymd.month()),
+        static_cast<unsigned>(ymd.day()));
+}
+
+static std::string pg_usec_to_time_str(int64_t usec) noexcept {
+    int64_t secs = usec / 1'000'000;
+    int64_t us   = usec % 1'000'000;
+    int h = static_cast<int>(secs / 3600);
+    int m = static_cast<int>((secs % 3600) / 60);
+    int s = static_cast<int>(secs % 60);
+    if (us == 0) return std::format("{:02d}:{:02d}:{:02d}", h, m, s);
+    return std::format("{:02d}:{:02d}:{:02d}.{:06d}", h, m, s, static_cast<int>(us));
+}
+
+static std::string pg_usec_to_ts_str(int64_t usec) noexcept {
+    int64_t secs     = usec / 1'000'000;
+    int64_t us       = usec % 1'000'000;
+    if (us < 0) { --secs; us += 1'000'000; }
+    int64_t days_n   = secs / 86400;
+    int64_t day_secs = secs % 86400;
+    if (day_secs < 0) { --days_n; day_secs += 86400; }
+    auto dp  = kPgDateEpoch + std::chrono::days{days_n};
+    auto ymd = std::chrono::year_month_day{dp};
+    int h = static_cast<int>(day_secs / 3600);
+    int mn = static_cast<int>((day_secs % 3600) / 60);
+    int sc = static_cast<int>(day_secs % 60);
+    if (us == 0)
+        return std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}",
+            static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
+            static_cast<unsigned>(ymd.day()), h, mn, sc);
+    return std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:06d}",
+        static_cast<int>(ymd.year()), static_cast<unsigned>(ymd.month()),
+        static_cast<unsigned>(ymd.day()), h, mn, sc, static_cast<int>(us));
+}
+
+// ─── CellData ────────────────────────────────────────────────────────────────
 
 struct CellData {
     Value::Type type = Value::Type::Null;
@@ -90,6 +141,19 @@ static CellData read_pg_column_binary(PGresult* res, int row, int col) noexcept 
             c.type = Value::Type::Blob;
             c.text.assign(val, static_cast<size_t>(len));
             break;
+        case OID_DATE:
+            c.type = Value::Type::Text;
+            c.text = pg_days_to_date_str(from_be<int32_t>(val));
+            break;
+        case OID_TIME:
+            c.type = Value::Type::Text;
+            c.text = pg_usec_to_time_str(from_be<int64_t>(val));
+            break;
+        case OID_TIMESTAMP:
+        case OID_TIMESTAMPTZ:
+            c.type = Value::Type::Text;
+            c.text = pg_usec_to_ts_str(from_be<int64_t>(val));
+            break;
         default:
             c.type = Value::Type::Text;
             c.text.assign(val, static_cast<size_t>(len));
@@ -98,35 +162,35 @@ static CellData read_pg_column_binary(PGresult* res, int row, int col) noexcept 
     return c;
 }
 
-// ─── PgParams — zero-alloc 파라미터 배열 ─────────────────────────────────────
+// ─── PgParams — zero-alloc parameter array ───────────────────────────────────
 //
-// 설계 원칙:
-//  • Text  → string_view 포인터 직접 사용 (zero-copy, 할당 없음)
-//  • Null  → nullptr (할당 없음)
-//  • Bool  → 정적 리터럴 "t"/"f" (할당 없음)
-//  • Int64 / Float64 → 스택 고정 버퍼에 to_chars (할당 없음)
-//  • Blob  → hex 변환만 blob_bufs_ 에 std::string 할당 (드문 경우)
+// Design principles:
+//  • Text    → use string_view pointer directly (zero-copy, no allocation)
+//  • Null    → nullptr (no allocation)
+//  • Bool    → static literal "t"/"f" (no allocation)
+//  • Int64 / Float64 → to_chars into a fixed stack buffer (no allocation)
+//  • Blob    → only blob_bufs_ allocates a std::string for hex encoding (rare)
 //
-// ≤16 파라미터: 완전 스택 (힙 0회)
-// >16 파라미터: values/lengths/formats + num_bufs 만 힙 1회
+// ≤16 params: fully stack-allocated (0 heap allocations)
+// >16 params: one heap allocation for values/lengths/formats + num_bufs
 
 struct PgParams {
     static constexpr size_t kInline   = 16;
-    static constexpr size_t kNumBufSz = 32; // int64_t 최대 20자 + double 최대 ~24자
+    static constexpr size_t kNumBufSz = 32; // int64_t max 20 chars + double max ~24 chars
 
-    // ── 인라인 스토리지 (≤kInline) ──────────────────────────────────────────
-    char        num_buf_[kInline][kNumBufSz]{};  // 숫자/bool 직렬화 버퍼
+    // ── Inline storage (≤kInline) ───────────────────────────────────────────
+    char        num_buf_[kInline][kNumBufSz]{};  // numeric/bool serialization buffer
     const char* values_inline_[kInline]{};
     int         lengths_inline_[kInline]{};
     int         formats_inline_[kInline]{};
 
-    // ── 힙 스토리지 (>kInline) ──────────────────────────────────────────────
+    // ── Heap storage (>kInline) ──────────────────────────────────────────────
     std::vector<std::array<char, kNumBufSz>> num_buf_heap_;
     std::vector<const char*>                 values_heap_;
     std::vector<int>                         lengths_heap_;
     std::vector<int>                         formats_heap_;
 
-    // ── Blob 변환 버퍼 (드문 경우만) ───────────────────────────────────────
+    // ── Blob conversion buffer (only for Blob values) ───────────────────────
     std::vector<std::string> blob_bufs_;
 
     const char** values_{nullptr};
@@ -154,7 +218,7 @@ struct PgParams {
             formats_ = formats_heap_.data();
         }
 
-        blob_bufs_.reserve(n); // Blob 있을 때 재할당 방지 (포인터 안정성)
+        blob_bufs_.reserve(n); // prevent realloc on Blob values (pointer stability)
 
         static constexpr char kHex[] = "0123456789abcdef";
 
@@ -168,7 +232,7 @@ struct PgParams {
                     values_[i] = nullptr; lengths_[i] = 0;
                     break;
                 case Value::Type::Text: {
-                    // zero-copy: params span은 PQsend* 완료까지 유효
+                    // zero-copy: params span remains valid until PQsend* completes
                     auto sv    = v.get<std::string_view>();
                     values_[i] = sv.data();
                     lengths_[i]= static_cast<int>(sv.size());
@@ -185,7 +249,7 @@ struct PgParams {
                     break;
                 }
                 case Value::Type::Float64: {
-                    // chars_format::general: 최단 round-trip 표현
+                    // chars_format::general: shortest round-trip representation
                     auto [ptr, _] = std::to_chars(nb, nb + kNumBufSz,
                                                   v.get<double>(),
                                                   std::chars_format::general);
@@ -310,19 +374,35 @@ static Result<std::unique_ptr<IResultSet>> build_result_set(PGresult* res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 비동기 Awaiter — libpq 소켓을 Reactor 이벤트에 통합
+// Async awaiters — integrate libpq socket with Reactor events
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── PgReadAwaiter ────────────────────────────────────────────────────────────
 //
-// [핵심 최적화] PQexecParams(블로킹) → PQsendQueryParams + co_await PgReadAwaiter
+// Non-blocking replacement for PQexecParams (blocking):
+//   PQsendQueryParams → co_await PgFlushAwaiter → co_await PgReadAwaiter
 //
-// PQisBusy() == true 이면 reactor 이벤트 등록 후 coroutine yield.
-// 소켓이 readable 이 될 때마다 PQconsumeInput → PQisBusy 체크 반복.
-// 결과 준비 완료 시 unregister_event → reactor->post(resume) 로 깨움.
-// → reactor thread 를 전혀 block 하지 않음.
+// await_suspend registers a kqueue Read event. When the socket becomes readable,
+// we call PQconsumeInput in a loop (up to kMaxDrainIter times) to drain all
+// available data — including records already buffered inside OpenSSL's internal
+// layer that SSL_read can return without a new OS recv().
+//
+// The kqueue reactor uses EV_CLEAR (edge-triggered): after the event fires it
+// will not re-fire unless new bytes arrive at the OS socket level. If the server
+// sends NOTICE + query result in the same TCP segment, both arrive together.
+// PQconsumeInput processes one SSL record per call, so a single call may only
+// consume the NOTICE, leaving the result in SSL's buffer. Without the drain loop,
+// PQisBusy stays true, we return, and kqueue never fires again (the OS socket
+// buffer is already empty) — causing a permanent hang.
+//
+// The drain loop fixes this: we keep calling PQconsumeInput until PQisBusy is
+// false (result ready) or until all kMaxDrainIter calls have been exhausted
+// (genuinely waiting for more bytes from the server — kqueue event stays
+// registered and will fire when new OS-level data arrives).
 
 struct PgReadAwaiter {
+    static constexpr int kMaxDrainIter = 16;
+
     PGconn*   conn;
     PGresult* result{nullptr};
 
@@ -330,7 +410,7 @@ struct PgReadAwaiter {
         PQconsumeInput(conn);
         if (PQisBusy(conn)) return false;
         result = PQgetResult(conn);
-        while (PGresult* r = PQgetResult(conn)) PQclear(r); // 잔여 결과 drain
+        while (PGresult* r = PQgetResult(conn)) PQclear(r); // drain trailing results
         return true;
     }
 
@@ -340,13 +420,42 @@ struct PgReadAwaiter {
 
         reactor->register_event(fd, EventType::Read,
             [this, h, fd, reactor](int) mutable {
-                PQconsumeInput(conn);
-                if (PQisBusy(conn)) return; // 데이터 더 필요, 이벤트 유지
+                // IMPORTANT: copy captured values to stack-locals FIRST.
+                //
+                // unregister_event() calls entry->read_cb = nullptr, which destroys
+                // this std::function closure. Our captures (this, h, reactor, fd) are
+                // stored inside that closure. If the closure is heap-allocated (total
+                // captures > libc++ SBO of 24 bytes — which they are: 3 ptrs + int =
+                // 28 bytes), the heap block is freed by the destructor. Accessing any
+                // captured variable after that point is use-after-free.
+                //
+                // Stack-local copies are unaffected by the closure's destruction and
+                // remain valid for the rest of this call frame.
+                PgReadAwaiter* pga      = this;     // PgReadAwaiter lives in coroutine frame
+                Reactor*       lreactor = reactor;
+                int            lfd      = fd;
+                auto           lh       = h;
 
-                reactor->unregister_event(fd, EventType::Read);
-                result = PQgetResult(conn);
-                while (PGresult* r = PQgetResult(conn)) PQclear(r);
-                reactor->post([h]() mutable { h.resume(); });
+                // Drain all SSL-buffered records. Each PQconsumeInput call processes
+                // one SSL record. With EV_CLEAR kqueue, we must drain here rather than
+                // waiting for another kqueue event: SSL may have already consumed all
+                // OS socket bytes into its internal buffer, so EV_CLEAR won't re-fire.
+                for (int i = 0; i < kMaxDrainIter; ++i) {
+                    PQconsumeInput(pga->conn);
+                    if (!PQisBusy(pga->conn)) {
+                        // Collect the result BEFORE unregistering (closure still valid).
+                        pga->result = PQgetResult(pga->conn);
+                        while (PGresult* r = PQgetResult(pga->conn)) PQclear(r);
+                        // unregister_event may free this closure — use stack-locals only below.
+                        lreactor->unregister_event(lfd, EventType::Read);
+                        lreactor->post([lh]() mutable { lh.resume(); });
+                        return;
+                    }
+                }
+                // Still busy after kMaxDrainIter attempts: all SSL records consumed,
+                // but the server hasn't sent a complete response yet.
+                // The kqueue event remains registered and will re-fire when new
+                // OS-level bytes arrive.
             });
     }
 
@@ -355,8 +464,8 @@ struct PgReadAwaiter {
 
 // ─── PgFlushAwaiter ───────────────────────────────────────────────────────────
 //
-// PQflush() == 1 (송신 버퍼 가득) 이면 소켓 writable 이벤트를 기다린다.
-// 실제로는 작은 쿼리에서 PQflush == 0 이 즉시 반환되므로 await_ready == true.
+// If PQflush() == 1 (send buffer full), wait for the socket to become writable.
+// For small queries PQflush() returns 0 immediately, so await_ready() == true.
 
 struct PgFlushAwaiter {
     PGconn* conn;
@@ -376,21 +485,21 @@ struct PgFlushAwaiter {
     void await_resume() noexcept {}
 };
 
-// ─── async_flush — 송신 버퍼가 완전히 비워질 때까지 반복 flush ────────────────
+// ─── async_flush — repeatedly flush until the send buffer is fully drained ───
 
 static Task<bool> async_flush(PGconn* conn) {
     while (true) {
         const int rc = PQflush(conn);
-        if (rc ==  0) co_return true;   // 전송 완료
-        if (rc == -1) co_return false;  // 에러
-        co_await PgFlushAwaiter{conn};  // 소켓 쓰기 대기 후 재시도
+        if (rc ==  0) co_return true;   // send complete
+        if (rc == -1) co_return false;  // error
+        co_await PgFlushAwaiter{conn};  // wait for socket writable, then retry
     }
 }
 
-// ─── 비동기 쿼리 헬퍼 ─────────────────────────────────────────────────────────
+// ─── Async query helpers ──────────────────────────────────────────────────────
 //
-// PQsend* → async_flush → PgReadAwaiter 의 3단계 패턴을 묶음.
-// 모두 resultFormat=1 (binary) 로 요청.
+// Wraps the three-step pattern: PQsend* → async_flush → PgReadAwaiter.
+// All queries request resultFormat=1 (binary).
 
 static Task<PGresult*> async_simple(PGconn* conn, const char* sql) {
     if (PQsendQuery(conn, sql) == 0) co_return nullptr;
@@ -427,7 +536,7 @@ static Task<PGresult*> async_prepare(PGconn* conn, const char* name,
     co_return co_await PgReadAwaiter{conn};
 }
 
-// ─── 연결 소켓 non-blocking 설정 ─────────────────────────────────────────────
+// ─── Set connection socket to non-blocking ───────────────────────────────────
 
 static void make_nonblocking(PGconn* conn) noexcept {
     const int fd = PQsocket(conn);
@@ -443,7 +552,7 @@ struct Slot {
     using Clock = std::chrono::steady_clock;
 
     PGconn*          conn{nullptr};
-    std::mutex       mutex;          // PQsend* 호출 직렬화 (비동기 대기 구간 제외)
+    std::mutex       mutex;          // serializes PQsend* calls (released during co_await)
     uint64_t         stmt_counter{0};
     Clock::time_point idle_since{Clock::now()};
 
@@ -455,20 +564,20 @@ struct Slot {
 
     void mark_idle() noexcept { idle_since = Clock::now(); }
 
-    // 30초 이상 idle 상태 → 클라우드 방화벽/로드밸런서가 연결을 끊었을 수 있음
+    // Idle for 30+ seconds — cloud firewall/load-balancer may have silently closed the TCP conn.
     [[nodiscard]] bool needs_liveness_check() const noexcept {
         return (Clock::now() - idle_since) > std::chrono::seconds{30};
     }
 };
 
-// ─── PgAcquireAwaiter — 풀 소진 시 대기 ─────────────────────────────────────
+// ─── PgAcquireAwaiter — wait when pool is exhausted ──────────────────────────
 //
-// [동시접속 최적화] acquire() 가 풀 소진을 만나면 즉시 에러 대신 yield.
-// release() 가 호출될 때 대기 큐의 첫 waiter 에게 슬롯을 직접 전달하고
-// 해당 waiter 의 reactor thread 에서 resume.
-// → 불필요한 에러 반환 없이 max_size 개 동시 쿼리 지원.
+// When acquire() finds no idle slot, yield instead of returning an error.
+// When release() is called it hands the slot directly to the first waiter and
+// resumes it on that waiter's reactor thread.
+// → supports max_size concurrent queries without spurious errors.
 
-class PgConnectionPool; // 전방 선언
+class PgConnectionPool; // forward declaration
 
 class PgConnection; // forward declaration
 
@@ -477,7 +586,7 @@ struct PgAcquireAwaiter {
     Result<std::unique_ptr<IConnection>>  result{unexpected(db_error(DbError::ConnectionFailed))};
 
     bool await_ready() const noexcept { return false; }
-    void await_suspend(std::coroutine_handle<> h) noexcept;   // 정의는 아래
+    void await_suspend(std::coroutine_handle<> h) noexcept;   // defined below
     Result<std::unique_ptr<IConnection>> await_resume() noexcept {
         return std::move(result);
     }
@@ -491,7 +600,7 @@ public:
         : slot_(slot), name_(std::move(name)) {}
 
     ~PgStatement() override {
-        // DEALLOCATE 는 동기 — 드라이버 소멸 경로이므로 빈도 낮음
+        // DEALLOCATE is synchronous — infrequent (only on statement destruction)
         std::lock_guard lock{slot_->mutex};
         const std::string sql = "DEALLOCATE \"" + name_ + "\"";
         PGresult* res = PQexec(slot_->conn, sql.c_str());
@@ -504,7 +613,7 @@ public:
         PGresult* res;
         {
             std::lock_guard lock{slot_->mutex};
-            // PQsend* 만 락 보호; co_await 구간은 락 해제 상태
+            // Lock covers only PQsend*; lock is released before co_await
             if (PQsendQueryPrepared(slot_->conn, name_.c_str(),
                                     pg.n(), pg.values(), pg.lengths(),
                                     pg.formats(), 1) == 0)
@@ -704,18 +813,18 @@ public:
 
     bool is_valid() const noexcept { return !slots_.empty(); }
 
-    // ─── 커넥션 획득 ─────────────────────────────────────────────────────────
+    // ─── acquire — connection checkout ───────────────────────────────────────
     //
-    // [최적화 흐름]
-    // 1. idle 슬롯 존재 → 즉시 반환 (O(1), lock 해제 후 진행)
-    // 2. idle 없고 max_size 미만 → 새 슬롯 생성
-    // 3. 풀 소진 → co_await PgAcquireAwaiter → reactor yield
-    //    release() 가 호출되면 waiter 에게 슬롯을 직접 전달하고 resume
+    // Fast path (in order):
+    // 1. Idle slot exists → return immediately (O(1), lock released first)
+    // 2. No idle slot, below max_size → create a new slot
+    // 3. Pool exhausted → co_await PgAcquireAwaiter → reactor yield
+    //    When release() is called it hands the slot to the first waiter and resumes it.
 
     Task<Result<std::unique_ptr<IConnection>>> acquire() override {
         std::unique_lock lock{mutex_};
 
-        // 1. idle 슬롯 탐색
+        // 1. scan idle slots
         while (!idle_.empty()) {
             const size_t idx = idle_.front(); idle_.pop();
             Slot* slot = slots_[idx].get();
@@ -723,8 +832,8 @@ public:
 
             if (PQstatus(slot->conn) != CONNECTION_OK) PQreset(slot->conn);
             if (PQstatus(slot->conn) == CONNECTION_OK) {
-                // 30초 이상 idle → 클라우드 방화벽이 TCP를 silently drop 했을 수 있음.
-                // PQstatus()는 로컬 상태만 반영하므로 비동기 SELECT 1로 실제 활성 여부 확인.
+                // Idle 30+ seconds — cloud firewall may have silently dropped the TCP conn.
+                // PQstatus() reflects only local state; verify liveness with async SELECT 1.
                 if (slot->needs_liveness_check()) {
                     bool alive = false;
                     {
@@ -738,13 +847,13 @@ public:
                         if (res) PQclear(res);
                     }
                     if (!alive) {
-                        // ping 실패 → 재연결 시도
+                        // Ping failed — try to reconnect.
                         PGconn* fresh = PQconnectdb(conninfo_.c_str());
                         if (fresh && PQstatus(fresh) == CONNECTION_OK) {
                             PQfinish(slot->conn); slot->conn = fresh; make_nonblocking(fresh);
                         } else {
-                            // 재연결 불가 → 슬롯을 idle로 돌려놓고 즉시 에러 반환
-                            // (MySQL 일관성: 슬롯 고아화 방지 + 호출자가 핸들링 가능)
+                            // Reconnect failed — return slot to idle and surface the error.
+                            // (Consistent with MySQL driver: prevents slot orphaning.)
                             if (fresh) PQfinish(fresh);
                             lock.lock(); idle_.push(idx);
                             co_return unexpected(db_error(DbError::ConnectionFailed));
@@ -754,24 +863,24 @@ public:
                 active_.fetch_add(1, std::memory_order_relaxed);
                 co_return std::make_unique<PgConnection>(slot, idx, this);
             }
-            // PQreset 실패 → 새 연결로 교체
+            // PQreset failed — replace with a new connection
             PGconn* fresh = PQconnectdb(conninfo_.c_str());
             if (fresh && PQstatus(fresh) == CONNECTION_OK) {
                 PQfinish(slot->conn); slot->conn = fresh; make_nonblocking(fresh);
                 active_.fetch_add(1, std::memory_order_relaxed);
                 co_return std::make_unique<PgConnection>(slot, idx, this);
             }
-            // 신규 연결도 실패 → 슬롯을 idle로 돌려놓고 즉시 에러 반환
-            // (MySQL 일관성: 슬롯 고아화 방지 + DB down 시 hang 방지)
+            // New connection also failed — return slot to idle and surface the error.
+            // (Consistent with MySQL driver: prevents slot orphaning and hangs on DB down.)
             if (fresh) PQfinish(fresh);
             lock.lock(); idle_.push(idx);
             co_return unexpected(db_error(DbError::ConnectionFailed));
         }
 
-        // 2. 새 슬롯 생성
+        // 2. create a new slot
         if (slots_.size() < max_size_) {
             const size_t idx = slots_.size();
-            slots_.push_back(nullptr); // 자리 예약
+            slots_.push_back(nullptr); // reserve index
             lock.unlock();
 
             PGconn* c = PQconnectdb(conninfo_.c_str());
@@ -787,13 +896,13 @@ public:
             co_return std::make_unique<PgConnection>(slot, idx, this);
         }
 
-        // 3. 풀 소진 → yield (reactor thread 를 block 하지 않음)
+        // 3. pool exhausted — yield without blocking the reactor thread
         lock.unlock();
         co_return co_await PgAcquireAwaiter{this};
     }
 
-    // release() — PgConnection 소멸자에서 호출
-    // waiter 가 있으면 슬롯을 직접 넘기고 reactor 에서 resume
+    // release() — called from PgConnection destructor.
+    // If there is a waiter, hand the slot directly to it and resume on its reactor thread.
     void release(size_t idx) noexcept {
         active_.fetch_sub(1, std::memory_order_relaxed);
         std::unique_lock lock{mutex_};
@@ -801,11 +910,11 @@ public:
             auto [awaiter, h, reactor] = std::move(waiters_.front());
             waiters_.pop();
             lock.unlock();
-            // waiter 에게 슬롯 직접 전달
+            // hand the slot directly to the waiter
             awaiter->result = std::make_unique<PgConnection>(
                 slots_[idx].get(), idx, this);
             active_.fetch_add(1, std::memory_order_relaxed);
-            // waiter 의 reactor thread 에서 resume
+            // resume on the waiter's reactor thread
             reactor->post([h]() mutable { h.resume(); });
         } else {
             slots_[idx]->mark_idle();
@@ -847,13 +956,13 @@ private:
     std::atomic<size_t>                active_{0};
 };
 
-// ─── PgAcquireAwaiter::await_suspend 구현 (PgConnectionPool 완전 정의 후) ─────
+// ─── PgAcquireAwaiter::await_suspend — defined after PgConnectionPool is complete ──
 
 void PgAcquireAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
     pool->push_waiter(this, h, Reactor::current());
 }
 
-// ─── PgConnection::~PgConnection 구현 ────────────────────────────────────────
+// ─── PgConnection::~PgConnection ─────────────────────────────────────────────
 
 PgConnection::~PgConnection() {
     if (pool_) pool_->release(idx_);
