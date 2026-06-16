@@ -1,5 +1,6 @@
 #include "postgresql_driver.hpp"
 #include "db_error.hpp"
+#include "sql_placeholders.hpp"
 
 #include <libpq-fe.h>
 #include <qbuem/core/reactor.hpp>
@@ -647,9 +648,15 @@ public:
     Task<Result<void>> rollback() override { co_return co_await exec_simple("ROLLBACK"); }
 
     Task<Result<void>> savepoint(std::string_view name) override {
+        // Identifier is interpolated (not parameterizable); the surrounding
+        // double-quotes alone do not prevent injection via an embedded quote.
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return co_await exec_simple("SAVEPOINT \"" + std::string(name) + "\"");
     }
     Task<Result<void>> rollback_to(std::string_view name) override {
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return co_await exec_simple(
             "ROLLBACK TO SAVEPOINT \"" + std::string(name) + "\"");
     }

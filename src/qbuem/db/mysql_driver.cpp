@@ -1,5 +1,6 @@
 #include "mysql_driver.hpp"
 #include "db_error.hpp"
+#include "sql_placeholders.hpp"
 
 #include <mysql/mysql.h>
 #include <qbuem/core/task.hpp>
@@ -75,23 +76,8 @@ static MysqlDsn parse_dsn(std::string_view dsn) {
     return result;
 }
 
-// ─── $N → ? 플레이스홀더 변환 ────────────────────────────────────────────────
-
-static std::string convert_placeholders(std::string_view sql) {
-    std::string result;
-    result.reserve(sql.size());
-    std::size_t i = 0;
-    while (i < sql.size()) {
-        if (sql[i] == '$' && i + 1 < sql.size() && std::isdigit(sql[i + 1])) {
-            result += '?';
-            ++i;
-            while (i < sql.size() && std::isdigit(sql[i])) ++i;
-        } else {
-            result += sql[i++];
-        }
-    }
-    return result;
-}
+// $N → ? placeholder conversion: shared, string-literal-aware implementation.
+using qbuem_routine::db_detail::convert_placeholders;
 
 // ─── CellData ─────────────────────────────────────────────────────────────────
 
@@ -486,10 +472,14 @@ public:
         co_return exec_sql("ROLLBACK");
     }
     Task<Result<void>> savepoint(std::string_view name) override {
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         std::lock_guard lock{mx_};
         co_return exec_sql("SAVEPOINT " + std::string(name));
     }
     Task<Result<void>> rollback_to(std::string_view name) override {
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         std::lock_guard lock{mx_};
         co_return exec_sql("ROLLBACK TO SAVEPOINT " + std::string(name));
     }
