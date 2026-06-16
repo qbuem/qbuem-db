@@ -10,7 +10,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace qbuem;
@@ -22,13 +24,13 @@ namespace {
 // $N → ? placeholder conversion: shared, string-literal-aware implementation.
 using qbuem_routine::db_detail::convert_placeholders;
 
-// ─── CellData — 단일 컬럼 값 저장 ───────────────────────────────────────────
+// ─── CellData — stores a single column value ─────────────────────────────────
 
 struct CellData {
     Value::Type type = Value::Type::Null;
     int64_t     i64  = 0;
     double      f64  = 0.0;
-    std::string text; // TEXT / BLOB 모두 여기에 저장 (소유권 보장)
+    std::string text; // holds both TEXT and BLOB (owns the bytes)
 };
 
 // ─── Row ─────────────────────────────────────────────────────────────────────
@@ -110,7 +112,7 @@ private:
     uint64_t                                  last_id_;
 };
 
-// ─── 헬퍼: 파라미터 바인딩 ────────────────────────────────────────────────────
+// ─── Helper: parameter binding ────────────────────────────────────────────────
 
 static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
     switch (v.type()) {
@@ -126,7 +128,7 @@ static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
             break;
         case Value::Type::Text: {
             auto sv = v.get<std::string_view>();
-            // SQLITE_STATIC: params span은 sqlite3_step 완료까지 유효
+            // SQLITE_STATIC: the params span stays valid until sqlite3_step completes
             sqlite3_bind_text(stmt, idx, sv.data(),
                               static_cast<int>(sv.size()), SQLITE_STATIC);
             break;
@@ -140,7 +142,7 @@ static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
     }
 }
 
-// ─── 헬퍼: 컬럼 값 읽기 ──────────────────────────────────────────────────────
+// ─── Helper: read a column value ──────────────────────────────────────────────
 
 static CellData read_column(sqlite3_stmt* stmt, int col) {
     CellData c;
@@ -174,7 +176,7 @@ static CellData read_column(sqlite3_stmt* stmt, int col) {
     return c;
 }
 
-// ─── 헬퍼: stmt 실행 → ResultSet 빌드 ───────────────────────────────────────
+// ─── Helper: execute stmt → build ResultSet ──────────────────────────────────
 
 static Result<std::unique_ptr<IResultSet>>
 run_stmt(sqlite3* db, sqlite3_stmt* stmt, std::span<const Value> params) {
@@ -211,12 +213,38 @@ run_stmt(sqlite3* db, sqlite3_stmt* stmt, std::span<const Value> params) {
         std::move(rows), std::move(col_names), affected, last_id);
 }
 
+// ─── Forward declaration ──────────────────────────────────────────────────────
+
+class SqliteConnectionPool;
+
+// ─── Slot ─────────────────────────────────────────────────────────────────────
+// Owns one sqlite3* connection + its serializing mutex.  Held via shared_ptr so a
+// connection (and its statements/transactions) checked out of the pool keeps the
+// slot alive even if drain() clears the pool concurrently — otherwise a live
+// handle would touch a freed sqlite3/mutex (use-after-free).  Each pooled
+// connection is an independent sqlite3*, so under WAL multiple connections read
+// concurrently; the per-slot mutex (not a single global one) serializes only the
+// statements of one connection.
+
+struct SqliteSlot {
+    sqlite3*   conn{nullptr};
+    std::mutex mutex;
+
+    explicit SqliteSlot(sqlite3* c) noexcept : conn(c) {}
+    ~SqliteSlot() { if (conn) sqlite3_close_v2(conn); }
+
+    SqliteSlot(const SqliteSlot&)            = delete;
+    SqliteSlot& operator=(const SqliteSlot&) = delete;
+};
+
 // ─── Statement ────────────────────────────────────────────────────────────────
+// Holds a shared_ptr<SqliteSlot> keepalive (so the sqlite3*/mutex outlive it);
+// db_ and mx_ are cached from the slot for unchanged method bodies.
 
 class SqliteStatement final : public IStatement {
 public:
-    SqliteStatement(sqlite3* db, sqlite3_stmt* stmt, std::mutex& mx)
-        : db_(db), stmt_(stmt), mx_(mx) {}
+    SqliteStatement(std::shared_ptr<SqliteSlot> slot, sqlite3_stmt* stmt)
+        : slot_(std::move(slot)), db_(slot_->conn), stmt_(stmt), mx_(slot_->mutex) {}
 
     ~SqliteStatement() override {
         if (stmt_) sqlite3_finalize(stmt_);
@@ -245,6 +273,7 @@ public:
     }
 
 private:
+    std::shared_ptr<SqliteSlot> slot_; // keepalive — declared first (init order)
     sqlite3*      db_;
     sqlite3_stmt* stmt_;
     std::mutex&   mx_;
@@ -254,8 +283,8 @@ private:
 
 class SqliteTransaction final : public ITransaction {
 public:
-    SqliteTransaction(sqlite3* db, std::mutex& mx)
-        : db_(db), mx_(mx) {}
+    explicit SqliteTransaction(std::shared_ptr<SqliteSlot> slot)
+        : slot_(std::move(slot)), db_(slot_->conn), mx_(slot_->mutex) {}
 
     Task<Result<void>> commit() override {
         co_return exec_sql("COMMIT");
@@ -312,6 +341,7 @@ private:
         return {};
     }
 
+    std::shared_ptr<SqliteSlot> slot_; // keepalive — declared first (init order)
     sqlite3*    db_;
     std::mutex& mx_;
 };
@@ -320,8 +350,12 @@ private:
 
 class SqliteConnection final : public IConnection {
 public:
-    SqliteConnection(sqlite3* db, std::mutex& mx)
-        : db_(db), mx_(mx) {}
+    SqliteConnection(std::shared_ptr<SqliteSlot> slot, size_t slot_idx,
+                     SqliteConnectionPool* pool)
+        : slot_(std::move(slot)), db_(slot_->conn), mx_(slot_->mutex),
+          slot_idx_(slot_idx), pool_(pool) {}
+
+    ~SqliteConnection() override;  // defined below (after SqliteConnectionPool)
 
     ConnectionState state() const noexcept override { return state_; }
 
@@ -334,7 +368,7 @@ public:
                                     static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
             co_return unexpected(db_error(DbError::PrepareStatementFailed));
-        co_return std::make_unique<SqliteStatement>(db_, stmt, mx_);
+        co_return std::make_unique<SqliteStatement>(slot_, stmt);
     }
 
     Task<Result<std::unique_ptr<IResultSet>>>
@@ -361,7 +395,7 @@ public:
             co_return unexpected(db_error(DbError::TransactionFailed));
         }
         state_ = ConnectionState::Transaction;
-        co_return std::make_unique<SqliteTransaction>(db_, mx_);
+        co_return std::make_unique<SqliteTransaction>(slot_);
     }
 
     Task<Result<void>> close() override {
@@ -376,72 +410,172 @@ public:
     }
 
 private:
-    sqlite3*        db_;
-    std::mutex&     mx_;
-    ConnectionState state_{ConnectionState::Idle};
+    std::shared_ptr<SqliteSlot> slot_; // keepalive — declared first (init order)
+    sqlite3*              db_;
+    std::mutex&           mx_;
+    size_t                slot_idx_;
+    SqliteConnectionPool* pool_;
+    ConnectionState       state_{ConnectionState::Idle};
 };
 
 // ─── ConnectionPool ───────────────────────────────────────────────────────────
+//
+// A real multi-connection pool: each slot is an independent sqlite3* on the same
+// database.  Under WAL this gives concurrent readers (writes still serialize —
+// inherent to SQLite).  A private in-memory database (":memory:") is per-handle,
+// so pooling it would hand out connections to *different* empty databases; for
+// that case the pool collapses to a single connection (max_size = 1).
+
+// Opens one sqlite3* and applies the standard pragmas. Returns nullptr on failure.
+static sqlite3* open_sqlite_connection(const std::string& path) {
+    const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+                    | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI;
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(path.c_str(), &db, flags, nullptr) != SQLITE_OK) {
+        if (db) sqlite3_close_v2(db);
+        return nullptr;
+    }
+    // Wait (instead of failing immediately with SQLITE_BUSY) when another
+    // writer holds the lock — essential under WAL with concurrent writers,
+    // otherwise transient contention surfaces as hard query failures.
+    sqlite3_busy_timeout(db, 5000); // 5s
+    // WAL mode: allows concurrent readers, serializes writers
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA foreign_keys=ON",         nullptr, nullptr, nullptr);
+    // Performance tuning
+    sqlite3_exec(db, "PRAGMA cache_size=-65536",       nullptr, nullptr, nullptr); // 64MB page cache
+    sqlite3_exec(db, "PRAGMA temp_store=MEMORY",       nullptr, nullptr, nullptr); // temp tables in memory
+    sqlite3_exec(db, "PRAGMA mmap_size=268435456",     nullptr, nullptr, nullptr); // 256MB mmap
+    sqlite3_exec(db, "PRAGMA page_size=4096",          nullptr, nullptr, nullptr); // 4KB pages (new DB only)
+    return db;
+}
+
+// True for a private in-memory database, where each connection is a distinct
+// empty DB and pooling would be incoherent (callers would get different DBs).  A
+// shared-cache URI (file:...?cache=shared) names a database multiple connections
+// share, so it IS poolable and excluded here.
+static bool is_private_memory(std::string_view path) {
+    if (path == ":memory:" || path.empty()) return true;
+    const bool memory = path.find("mode=memory") != std::string_view::npos
+                     || path.find(":memory:")    != std::string_view::npos;
+    const bool shared = path.find("cache=shared") != std::string_view::npos;
+    return memory && !shared;
+}
 
 class SqliteConnectionPool final : public IConnectionPool {
 public:
-    explicit SqliteConnectionPool(std::string_view path) {
-        int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
-                  | SQLITE_OPEN_FULLMUTEX;
-        if (sqlite3_open_v2(std::string(path).c_str(), &db_, flags, nullptr)
-                != SQLITE_OK) {
-            db_ = nullptr;
-            return;
+    SqliteConnectionPool(std::string path, PoolConfig config)
+        : path_(std::move(path)) {
+        // A private in-memory DB can only ever be a single connection.
+        const bool single = is_private_memory(path_);
+        max_size_ = single ? 1 : (config.max_size > 0 ? config.max_size : 16);
+        size_t min_sz = single ? 1 : (config.min_size > 0 ? config.min_size : 2);
+        if (min_sz > max_size_) min_sz = max_size_;
+
+        std::lock_guard lock{mutex_};
+        for (size_t i = 0; i < min_sz; ++i) {
+            sqlite3* c = open_sqlite_connection(path_);
+            if (!c) break;
+            idle_.push(slots_.size());
+            slots_.push_back(std::make_shared<SqliteSlot>(c));
         }
-        // Wait (instead of failing immediately with SQLITE_BUSY) when another
-        // writer holds the lock — essential under WAL with concurrent writers,
-        // otherwise transient contention surfaces as hard query failures.
-        sqlite3_busy_timeout(db_, 5000); // 5s
-        // WAL 모드: 동시 읽기 허용, 쓰기 직렬화
-        sqlite3_exec(db_, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);
-        sqlite3_exec(db_, "PRAGMA foreign_keys=ON",         nullptr, nullptr, nullptr);
-        // 성능 최적화
-        sqlite3_exec(db_, "PRAGMA cache_size=-65536",       nullptr, nullptr, nullptr); // 64MB 페이지 캐시
-        sqlite3_exec(db_, "PRAGMA temp_store=MEMORY",       nullptr, nullptr, nullptr); // 임시 테이블 메모리
-        sqlite3_exec(db_, "PRAGMA mmap_size=268435456",     nullptr, nullptr, nullptr); // 256MB mmap
-        sqlite3_exec(db_, "PRAGMA page_size=4096",          nullptr, nullptr, nullptr); // 4KB 페이지 (신규 DB만)
     }
 
-    ~SqliteConnectionPool() override {
-        if (db_) sqlite3_close_v2(db_);
-    }
+    ~SqliteConnectionPool() override = default;
 
-    bool is_valid() const noexcept { return db_ != nullptr; }
+    bool is_valid() const noexcept { return !slots_.empty(); }
 
     Task<Result<std::unique_ptr<IConnection>>> acquire() override {
-        if (!db_)
-            co_return unexpected(
-                db_error(DbError::ConnectionFailed));
-        active_.fetch_add(1, std::memory_order_relaxed);
-        co_return std::make_unique<SqliteConnection>(db_, mutex_);
+        std::unique_lock lock{mutex_};
+
+        // 1. idle slot
+        if (!idle_.empty()) {
+            const size_t idx = idle_.front(); idle_.pop();
+            std::shared_ptr<SqliteSlot> slot = slots_[idx];
+            active_.fetch_add(1, std::memory_order_relaxed);
+            lock.unlock();
+            co_return std::make_unique<SqliteConnection>(std::move(slot), idx, this);
+        }
+
+        // 2. create a new slot
+        if (slots_.size() < max_size_) {
+            const size_t idx = slots_.size();
+            slots_.push_back(nullptr); // reserve the index
+            lock.unlock();
+
+            sqlite3* c = open_sqlite_connection(path_);
+            if (!c) {
+                lock.lock(); slots_.pop_back();
+                co_return unexpected(db_error(DbError::ConnectionFailed));
+            }
+            auto slot = std::make_shared<SqliteSlot>(c);
+            lock.lock();
+            slots_[idx] = slot;
+            lock.unlock();
+            active_.fetch_add(1, std::memory_order_relaxed);
+            co_return std::make_unique<SqliteConnection>(std::move(slot), idx, this);
+        }
+
+        // 3. pool exhausted → immediate error (synchronous driver)
+        co_return unexpected(db_error(DbError::PoolExhausted));
     }
 
-    void return_connection(std::unique_ptr<IConnection>) noexcept override {
+    void release(size_t idx) noexcept {
         active_.fetch_sub(1, std::memory_order_relaxed);
+        std::lock_guard lock{mutex_};
+        // If the pool was drained while this connection was checked out, its slot
+        // entry is gone; the connection's own shared_ptr<SqliteSlot> still owns
+        // (and will close) the sqlite3*, so there is no use-after-free.
+        if (idx >= slots_.size() || !slots_[idx]) return;
+        idle_.push(idx);
     }
+
+    // return_connection is handled by the unique_ptr destructor path:
+    // ~SqliteConnection → release().
+    void return_connection(std::unique_ptr<IConnection>) noexcept override {}
 
     size_t active_count() const noexcept override {
         return active_.load(std::memory_order_relaxed);
     }
-    size_t idle_count() const noexcept override { return 0; }
-    size_t max_size()   const noexcept override { return 1; }
+    size_t idle_count() const noexcept override {
+        std::lock_guard lock{mutex_}; return idle_.size();
+    }
+    size_t max_size() const noexcept override { return max_size_; }
 
     Task<void> drain() override {
-        if (db_) { sqlite3_close_v2(db_); db_ = nullptr; }
+        std::lock_guard lock{mutex_};
+        while (!idle_.empty()) idle_.pop();
+        slots_.clear();
+        active_.store(0, std::memory_order_relaxed);
         co_return;
     }
 
 private:
-    sqlite3*            db_    = nullptr;
-    std::mutex          mutex_;
-    std::atomic<size_t> active_{0};
+    std::string                              path_;
+    size_t                                   max_size_{1};
+    mutable std::mutex                       mutex_;
+    // shared_ptr so a checked-out connection keeps its SqliteSlot (sqlite3* +
+    // mutex) alive even if drain() clears the pool concurrently.
+    std::vector<std::shared_ptr<SqliteSlot>> slots_;
+    std::queue<size_t>                       idle_;
+    std::atomic<size_t>                      active_{0};
 };
+
+// ─── SqliteConnection::~SqliteConnection ──────────────────────────────────────
+
+SqliteConnection::~SqliteConnection() {
+    // Roll back a transaction the holder left open (BEGIN with no COMMIT/ROLLBACK)
+    // before the slot returns to the pool, so transaction state never bleeds into
+    // the next user of this pooled connection.  sqlite3_get_autocommit()==0 means
+    // a transaction is still active; it costs nothing on the normal path.
+    if (slot_ && db_) {
+        std::lock_guard lock{mx_};
+        if (sqlite3_get_autocommit(db_) == 0)
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    if (pool_) pool_->release(slot_idx_);
+}
 
 // ─── Driver ───────────────────────────────────────────────────────────────────
 
@@ -453,21 +587,22 @@ public:
         return dsn.starts_with("sqlite://");
     }
 
-    // sqlite:///path/to/file.db  또는  sqlite://:memory:
+    // sqlite:///path/to/file.db  or  sqlite://:memory:  or a URI
+    // (sqlite://file:name?mode=memory&cache=shared — poolable shared-cache DB).
     Task<Result<std::unique_ptr<IConnectionPool>>>
-    pool(std::string_view dsn, PoolConfig /*config*/) override {
-        std::string_view path = dsn.substr(9); // "sqlite://" 제거
-        auto p = std::make_unique<SqliteConnectionPool>(path);
+    pool(std::string_view dsn, PoolConfig config) override {
+        std::string path{dsn.substr(9)}; // strip "sqlite://"
+        auto p = std::make_unique<SqliteConnectionPool>(std::move(path),
+                                                        std::move(config));
         if (!p->is_valid())
-            co_return unexpected(
-                db_error(DbError::ConnectionFailed));
+            co_return unexpected(db_error(DbError::ConnectionFailed));
         co_return p;
     }
 };
 
 } // anonymous namespace
 
-// ─── 팩토리 ────────────────────────────────────────────────────────────────────
+// ─── Factory ──────────────────────────────────────────────────────────────────
 
 std::unique_ptr<qbuem::db::IDBDriver> make_sqlite_driver() {
     return std::make_unique<SqliteDriver>();

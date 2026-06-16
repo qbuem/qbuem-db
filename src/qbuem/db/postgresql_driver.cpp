@@ -597,8 +597,8 @@ struct PgAcquireAwaiter {
 
 class PgStatement final : public IStatement {
 public:
-    PgStatement(Slot* slot, std::string name)
-        : slot_(slot), name_(std::move(name)) {}
+    PgStatement(std::shared_ptr<Slot> slot, std::string name)
+        : slot_(std::move(slot)), name_(std::move(name)) {}
 
     ~PgStatement() override {
         // DEALLOCATE is synchronous — infrequent (only on statement destruction)
@@ -634,15 +634,15 @@ public:
     }
 
 private:
-    Slot*       slot_;
-    std::string name_;
+    std::shared_ptr<Slot> slot_;
+    std::string           name_;
 };
 
 // ─── Transaction ──────────────────────────────────────────────────────────────
 
 class PgTransaction final : public ITransaction {
 public:
-    explicit PgTransaction(Slot* slot) : slot_(slot) {}
+    explicit PgTransaction(std::shared_ptr<Slot> slot) : slot_(std::move(slot)) {}
 
     Task<Result<void>> commit()   override { co_return co_await exec_simple("COMMIT"); }
     Task<Result<void>> rollback() override { co_return co_await exec_simple("ROLLBACK"); }
@@ -697,15 +697,15 @@ private:
         co_return {};
     }
 
-    Slot* slot_;
+    std::shared_ptr<Slot> slot_;
 };
 
 // ─── Connection ───────────────────────────────────────────────────────────────
 
 class PgConnection final : public IConnection {
 public:
-    PgConnection(Slot* slot, size_t idx, PgConnectionPool* pool) noexcept
-        : slot_(slot), idx_(idx), pool_(pool) {}
+    PgConnection(std::shared_ptr<Slot> slot, size_t idx, PgConnectionPool* pool) noexcept
+        : slot_(std::move(slot)), idx_(idx), pool_(pool) {}
 
     ~PgConnection() override;
 
@@ -789,7 +789,7 @@ public:
     }
 
 private:
-    Slot*             slot_;
+    std::shared_ptr<Slot> slot_;
     size_t            idx_;
     PgConnectionPool* pool_;
     ConnectionState   state_{ConnectionState::Idle};
@@ -814,7 +814,7 @@ public:
             PGconn* c = PQconnectdb(conninfo_.c_str());
             if (!c || PQstatus(c) != CONNECTION_OK) { if (c) PQfinish(c); break; }
             idle_.push(slots_.size());
-            slots_.push_back(std::make_unique<Slot>(c));
+            slots_.push_back(std::make_shared<Slot>(c));
         }
     }
 
@@ -834,7 +834,7 @@ public:
         // 1. scan idle slots
         while (!idle_.empty()) {
             const size_t idx = idle_.front(); idle_.pop();
-            Slot* slot = slots_[idx].get();
+            std::shared_ptr<Slot> slot = slots_[idx];
             lock.unlock();
 
             if (PQstatus(slot->conn) != CONNECTION_OK) PQreset(slot->conn);
@@ -896,11 +896,10 @@ public:
                 lock.lock(); slots_.pop_back();
                 co_return unexpected(db_error(DbError::ConnectionFailed));
             }
-            auto s = std::make_unique<Slot>(c);
-            Slot* slot = s.get();
-            lock.lock(); slots_[idx] = std::move(s); lock.unlock();
+            auto s = std::make_shared<Slot>(c);
+            lock.lock(); slots_[idx] = s; lock.unlock();
             active_.fetch_add(1, std::memory_order_relaxed);
-            co_return std::make_unique<PgConnection>(slot, idx, this);
+            co_return std::make_unique<PgConnection>(std::move(s), idx, this);
         }
 
         // 3. pool exhausted — yield without blocking the reactor thread
@@ -913,13 +912,17 @@ public:
     void release(size_t idx) noexcept {
         active_.fetch_sub(1, std::memory_order_relaxed);
         std::unique_lock lock{mutex_};
+        // If the pool was drained while this connection was checked out, its slot
+        // is gone — there is nothing to return.  The connection's own
+        // shared_ptr<Slot> already freed (or will free) the underlying PGconn.
+        if (idx >= slots_.size() || !slots_[idx]) return;
         if (!waiters_.empty()) {
             auto [awaiter, h, reactor] = std::move(waiters_.front());
             waiters_.pop();
             lock.unlock();
             // hand the slot directly to the waiter
             awaiter->result = std::make_unique<PgConnection>(
-                slots_[idx].get(), idx, this);
+                slots_[idx], idx, this);
             active_.fetch_add(1, std::memory_order_relaxed);
             // resume on the waiter's reactor thread
             reactor->post([h]() mutable { h.resume(); });
@@ -957,7 +960,10 @@ private:
     std::string                        conninfo_;
     size_t                             max_size_;
     mutable std::mutex                 mutex_;
-    std::vector<std::unique_ptr<Slot>> slots_;
+    // shared_ptr so a connection checked out of the pool keeps its Slot (PGconn
+    // + mutex) alive even if drain() clears the pool concurrently — otherwise a
+    // live connection would dereference a freed Slot/mutex (use-after-free).
+    std::vector<std::shared_ptr<Slot>> slots_;
     std::queue<size_t>                 idle_;
     std::queue<WaiterRecord>           waiters_;
     std::atomic<size_t>                active_{0};
@@ -972,6 +978,24 @@ void PgAcquireAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
 // ─── PgConnection::~PgConnection ─────────────────────────────────────────────
 
 PgConnection::~PgConnection() {
+    // Roll back any transaction the holder left open (or that aborted) before the
+    // slot returns to the pool, so transaction state never bleeds into the next
+    // user of this pooled connection.  PQtransactionStatus is a local check, so
+    // the normal (already-committed / never-began) path costs no round-trip;
+    // PQexec runs only when actually mid-transaction.  Best-effort and synchronous
+    // — this runs on the reactor thread before release(), and between operations
+    // the connection has no in-flight result (query() drains trailing results).
+    if (slot_) {
+        std::lock_guard lk{slot_->mutex};
+        PGconn* c = slot_->conn;
+        if (c && PQstatus(c) == CONNECTION_OK) {
+            const PGTransactionStatusType ts = PQtransactionStatus(c);
+            if (ts == PQTRANS_INTRANS || ts == PQTRANS_INERROR) {
+                PGresult* r = PQexec(c, "ROLLBACK");
+                if (r) PQclear(r);
+            }
+        }
+    }
     if (pool_) pool_->release(idx_);
 }
 

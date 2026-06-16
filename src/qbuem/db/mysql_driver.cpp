@@ -29,7 +29,7 @@ namespace {
 // the element type from the field itself so this builds on old and new client.
 using MyBool = std::remove_pointer_t<decltype(std::declval<MYSQL_BIND>().is_null)>;
 
-// ─── DSN 파서 ────────────────────────────────────────────────────────────────
+// ─── DSN parser ───────────────────────────────────────────────────────────────
 
 struct MysqlDsn {
     std::string user;
@@ -46,7 +46,7 @@ static MysqlDsn parse_dsn(std::string_view dsn) {
     if (dsn.starts_with("mysql://"))    dsn.remove_prefix(8);
     else if (dsn.starts_with("mariadb://")) dsn.remove_prefix(10);
 
-    // ssl 옵션
+    // ssl option
     if (auto pos = dsn.find('?'); pos != std::string_view::npos) {
         auto opts = dsn.substr(pos + 1);
         dsn       = dsn.substr(0, pos);
@@ -94,7 +94,7 @@ struct CellData {
     std::string text;
 };
 
-// ─── 컬럼 값 읽기 (text/string 표현으로부터) ──────────────────────────────────
+// ─── Column-value decode (from a text/string representation) ──────────────────
 
 static CellData cell_from_text(const char* val, unsigned long len,
                                  MYSQL_FIELD* field) noexcept {
@@ -215,7 +215,7 @@ private:
     uint64_t                                  last_id_;
 };
 
-// ─── 커넥션 생성 헬퍼 ─────────────────────────────────────────────────────────
+// ─── Connection-creation helper ───────────────────────────────────────────────
 
 static MYSQL* create_connection(const MysqlDsn& dsn) {
     MYSQL* conn = mysql_init(nullptr);
@@ -247,11 +247,11 @@ static MYSQL* create_connection(const MysqlDsn& dsn) {
     mysql_options(conn, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_server_public_key);
 #endif
 
-    // TCP keepalive — 클라우드 방화벽 idle 연결 drop 대응
+    // TCP keepalive — counters cloud-firewall dropping of idle connections
 #ifdef MYSQL_OPT_TCP_KEEPIDLE
-    const unsigned int keepidle     = 60;  // 60초 idle 후 probe 시작
-    const unsigned int keepinterval = 10;  // 10초 간격
-    const unsigned int keepcount    = 3;   // 3회 실패 시 연결 종료
+    const unsigned int keepidle     = 60;  // start probing after 60s idle
+    const unsigned int keepinterval = 10;  // 10s between probes
+    const unsigned int keepcount    = 3;   // close the connection after 3 failed probes
     mysql_options(conn, MYSQL_OPT_TCP_KEEPIDLE,     &keepidle);
     mysql_options(conn, MYSQL_OPT_TCP_KEEPINTERVAL, &keepinterval);
     mysql_options(conn, MYSQL_OPT_TCP_KEEPCOUNT,    &keepcount);
@@ -271,20 +271,20 @@ static MYSQL* create_connection(const MysqlDsn& dsn) {
     return conn;
 }
 
-// ─── 파라미터 바인딩 버퍼 (각 파라미터에 독립적인 숫자 버퍼 보장) ────────────
+// ─── Parameter-binding buffers (one independent numeric buffer per parameter) ──
 
 struct ParamBuf {
     int64_t i64{};
     double  f64{};
 };
 
-// ─── 준비된 stmt 실행 헬퍼 ────────────────────────────────────────────────────
-// 호출자는 반드시 해당 slot의 mutex를 보유한 상태로 호출해야 함.
-// stmt는 이미 prepare 완료 상태여야 하며, reset은 호출자 책임.
+// ─── Prepared-statement execution helper ──────────────────────────────────────
+// The caller MUST hold the owning slot's mutex when calling this.
+// stmt must already be prepared; resetting it is the caller's responsibility.
 
 static Result<std::unique_ptr<IResultSet>>
 exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
-    // 파라미터 바인딩 — zero-copy: Text/Blob은 Value 데이터 직접 참조
+    // Parameter binding — zero-copy: Text/Blob reference the Value data directly
     std::vector<ParamBuf>   num_bufs(params.size());
     std::vector<MYSQL_BIND> binds(params.size());
 
@@ -313,7 +313,7 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
             case Value::Type::Text: {
                 auto sv = v.get<std::string_view>();
                 b.buffer_type   = MYSQL_TYPE_STRING;
-                // zero-copy: params span은 exec 완료까지 유효
+                // zero-copy: the params span stays valid until exec completes
                 b.buffer        = const_cast<void*>(static_cast<const void*>(sv.data()));
                 b.buffer_length = static_cast<unsigned long>(sv.size());
                 break;
@@ -353,7 +353,7 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
     for (unsigned int i = 0; i < ncols; ++i)
         col_names->emplace_back(fields[i].name ? fields[i].name : "");
 
-    // 결과 바인딩 (TEXT 형식으로 수신)
+    // Result binding (received in TEXT form)
     std::vector<MYSQL_BIND>        res_binds(ncols);
     std::vector<std::vector<char>> col_bufs(ncols);
     std::vector<unsigned long>     col_lens(ncols, 0);
@@ -382,6 +382,11 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
         return unexpected(db_error(DbError::QueryFailed));
     }
 
+    // Scratch buffer for columns whose value exceeds the bound buffer (see below).
+    // It grows monotonically and is reused across cells; it is deliberately NOT one
+    // of the bound col_bufs.
+    std::vector<char> scratch;
+
     std::vector<std::vector<CellData>> rows;
     int fetch_rc;
     while ((fetch_rc = mysql_stmt_fetch(stmt)) == 0 || fetch_rc == MYSQL_DATA_TRUNCATED) {
@@ -392,14 +397,33 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
                 row.push_back(CellData{});
                 continue;
             }
-            // 데이터가 잘렸으면 정확한 크기로 재할당 후 재fetch
-            if (fetch_rc == MYSQL_DATA_TRUNCATED || col_lens[i] > col_bufs[i].size()) {
-                col_bufs[i].resize(col_lens[i] + 1);
-                res_binds[i].buffer        = col_bufs[i].data();
-                res_binds[i].buffer_length = col_lens[i];
-                mysql_stmt_fetch_column(stmt, &res_binds[i], i, 0);
+            // The library captured the bound buffer pointers in mysql_stmt_bind_result;
+            // it writes into THOSE on every mysql_stmt_fetch.  We therefore must never
+            // reallocate a bound col_bufs[i] inside this loop — doing so frees a buffer
+            // the library still holds, so the next fetch is a use-after-free.  When a
+            // value was truncated (its true length, reported via col_lens[i], exceeds
+            // the bound buffer), re-fetch the full value into a separate scratch buffer
+            // through a local MYSQL_BIND; the bound buffers stay untouched and valid.
+            if (col_lens[i] > col_bufs[i].size()) {
+                if (scratch.size() < col_lens[i]) scratch.resize(col_lens[i]);
+                MYSQL_BIND    rb{};
+                unsigned long rlen   = 0;
+                MyBool        rnull  = 0;
+                MyBool        rerror = 0;
+                std::memset(&rb, 0, sizeof(rb));
+                rb.buffer_type   = MYSQL_TYPE_STRING;
+                rb.buffer        = scratch.data();
+                rb.buffer_length = col_lens[i];
+                rb.length        = &rlen;
+                rb.is_null       = &rnull;
+                rb.error         = &rerror;
+                if (mysql_stmt_fetch_column(stmt, &rb, i, 0) == 0)
+                    row.push_back(cell_from_text(scratch.data(), col_lens[i], &fields[i]));
+                else
+                    row.push_back(CellData{}); // re-fetch failed → treat as NULL
+            } else {
+                row.push_back(cell_from_text(col_bufs[i].data(), col_lens[i], &fields[i]));
             }
-            row.push_back(cell_from_text(col_bufs[i].data(), col_lens[i], &fields[i]));
         }
         rows.push_back(std::move(row));
     }
@@ -409,7 +433,7 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
         std::move(rows), std::move(col_names), affected, last_id);
 }
 
-// ─── 쿼리 실행 헬퍼 (prepare → exec_stmt → close) ───────────────────────────
+// ─── Query execution helper (prepare → exec_stmt → close) ─────────────────────
 
 static Result<std::unique_ptr<IResultSet>>
 exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
@@ -430,16 +454,51 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     return result;
 }
 
-// ─── 전방 선언 ────────────────────────────────────────────────────────────────
+// ─── Forward declaration ──────────────────────────────────────────────────────
 
 class MysqlConnectionPool;
 
+// ─── Slot ─────────────────────────────────────────────────────────────────────
+// Owns one MYSQL* + its serializing mutex.  Held via shared_ptr so a connection
+// (and its statements/transactions) checked out of the pool keeps the slot alive
+// even if drain() clears the pool concurrently — otherwise a live handle would
+// touch a freed MYSQL/mutex (use-after-free).
+
+struct MysqlSlot {
+    using Clock = std::chrono::steady_clock;
+
+    MYSQL*             conn{nullptr};
+    std::mutex         mutex;
+    Clock::time_point  idle_since{Clock::now()};
+    // Set when begin() opens a transaction, cleared on commit()/rollback().  Lets
+    // the connection destructor roll back a transaction the holder left open so it
+    // never bleeds into the next user of this pooled connection.  (libmysqlclient
+    // exposes no public "in transaction?" query, hence this explicit flag.)
+    bool               in_txn{false};
+
+    explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
+    ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
+
+    MysqlSlot(const MysqlSlot&)            = delete;
+    MysqlSlot& operator=(const MysqlSlot&) = delete;
+
+    void mark_idle() noexcept { idle_since = Clock::now(); }
+
+    bool needs_liveness_check() const noexcept {
+        // Only ping connections that have been idle for more than 30s
+        return (Clock::now() - idle_since) > std::chrono::seconds{30};
+    }
+};
+
 // ─── Statement ────────────────────────────────────────────────────────────────
+// Holds a shared_ptr<MysqlSlot> keepalive (so the MYSQL*/mutex outlive it); db_
+// and mx_ are cached from the slot for unchanged method bodies.
 
 class MysqlStatement final : public IStatement {
 public:
-    MysqlStatement(MYSQL* db, std::string sql, std::mutex& mx)
-        : db_(db), sql_(std::move(sql)), mx_(mx) {}
+    MysqlStatement(std::shared_ptr<MysqlSlot> slot, std::string sql)
+        : slot_(std::move(slot)), db_(slot_->conn), sql_(std::move(sql)),
+          mx_(slot_->mutex) {}
 
     ~MysqlStatement() override {
         if (stmt_) mysql_stmt_close(stmt_);
@@ -475,6 +534,7 @@ private:
         return true;
     }
 
+    std::shared_ptr<MysqlSlot> slot_; // keepalive — declared first (init order)
     MYSQL_STMT* stmt_{nullptr};
     MYSQL*      db_;
     std::string sql_;
@@ -485,15 +545,20 @@ private:
 
 class MysqlTransaction final : public ITransaction {
 public:
-    MysqlTransaction(MYSQL* db, std::mutex& mx) : db_(db), mx_(mx) {}
+    explicit MysqlTransaction(std::shared_ptr<MysqlSlot> slot)
+        : slot_(std::move(slot)), db_(slot_->conn), mx_(slot_->mutex) {}
 
     Task<Result<void>> commit() override {
         std::lock_guard lock{mx_};
-        co_return exec_sql("COMMIT");
+        auto r = exec_sql("COMMIT");
+        slot_->in_txn = false; // transaction finalized (even on error: it is over)
+        co_return r;
     }
     Task<Result<void>> rollback() override {
         std::lock_guard lock{mx_};
-        co_return exec_sql("ROLLBACK");
+        auto r = exec_sql("ROLLBACK");
+        slot_->in_txn = false;
+        co_return r;
     }
     Task<Result<void>> savepoint(std::string_view name) override {
         if (!db_detail::is_safe_ident(name))
@@ -522,6 +587,7 @@ private:
         return {};
     }
 
+    std::shared_ptr<MysqlSlot> slot_; // keepalive — declared first (init order)
     MYSQL*      db_;
     std::mutex& mx_;
 };
@@ -530,17 +596,18 @@ private:
 
 class MysqlConnection final : public IConnection {
 public:
-    MysqlConnection(MYSQL* db, std::mutex& mx, size_t slot_idx,
+    MysqlConnection(std::shared_ptr<MysqlSlot> slot, size_t slot_idx,
                     MysqlConnectionPool* pool)
-        : db_(db), mx_(mx), slot_idx_(slot_idx), pool_(pool) {}
+        : slot_(std::move(slot)), db_(slot_->conn), mx_(slot_->mutex),
+          slot_idx_(slot_idx), pool_(pool) {}
 
-    ~MysqlConnection() override;  // 정의는 아래 (MysqlConnectionPool 완전 정의 후)
+    ~MysqlConnection() override;  // defined below (after MysqlConnectionPool is complete)
 
     ConnectionState state() const noexcept override { return state_; }
 
     Task<Result<std::unique_ptr<IStatement>>>
     prepare(std::string_view sql) override {
-        co_return std::make_unique<MysqlStatement>(db_, std::string(sql), mx_);
+        co_return std::make_unique<MysqlStatement>(slot_, std::string(sql));
     }
 
     Task<Result<std::unique_ptr<IResultSet>>>
@@ -561,12 +628,16 @@ public:
             const std::string set_sql =
                 std::string("SET TRANSACTION ISOLATION LEVEL ")
                 + std::string(kLevel[li < 4 ? li : 1]);
-            mysql_query(db_, set_sql.c_str());
+            // Surface a failed isolation-level set instead of silently running at
+            // the session default (a SERIALIZABLE request must not be downgraded).
+            if (mysql_query(db_, set_sql.c_str()))
+                co_return unexpected(db_error(DbError::TransactionFailed));
             if (mysql_query(db_, "START TRANSACTION"))
                 co_return unexpected(db_error(DbError::TransactionFailed));
+            slot_->in_txn = true;
         }
         state_ = ConnectionState::Transaction;
-        co_return std::make_unique<MysqlTransaction>(db_, mx_);
+        co_return std::make_unique<MysqlTransaction>(slot_);
     }
 
     Task<Result<void>> close() override {
@@ -580,34 +651,12 @@ public:
     }
 
 private:
+    std::shared_ptr<MysqlSlot> slot_; // keepalive — declared first (init order)
     MYSQL*               db_;
     std::mutex&          mx_;
     size_t               slot_idx_;
     MysqlConnectionPool* pool_;
     ConnectionState      state_{ConnectionState::Idle};
-};
-
-// ─── Slot ─────────────────────────────────────────────────────────────────────
-
-struct MysqlSlot {
-    using Clock = std::chrono::steady_clock;
-
-    MYSQL*             conn{nullptr};
-    std::mutex         mutex;
-    Clock::time_point  idle_since{Clock::now()};
-
-    explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
-    ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
-
-    MysqlSlot(const MysqlSlot&)            = delete;
-    MysqlSlot& operator=(const MysqlSlot&) = delete;
-
-    void mark_idle() noexcept { idle_since = Clock::now(); }
-
-    bool needs_liveness_check() const noexcept {
-        // 30초 이상 idle 상태였던 연결만 ping 확인
-        return (Clock::now() - idle_since) > std::chrono::seconds{30};
-    }
 };
 
 // ─── ConnectionPool ───────────────────────────────────────────────────────────
@@ -623,7 +672,7 @@ public:
             MYSQL* c = create_connection(dsn_);
             if (!c) break;
             idle_.push(slots_.size());
-            slots_.push_back(std::make_unique<MysqlSlot>(c));
+            slots_.push_back(std::make_shared<MysqlSlot>(c));
         }
     }
 
@@ -634,13 +683,13 @@ public:
     Task<Result<std::unique_ptr<IConnection>>> acquire() override {
         std::unique_lock lock{mutex_};
 
-        // 1. idle 슬롯
+        // 1. idle slot
         if (!idle_.empty()) {
             const size_t idx = idle_.front(); idle_.pop();
             lock.unlock();
 
-            auto* slot = slots_[idx].get();
-            // 30초 이상 놀았던 연결만 ping으로 확인 (매번 ping 방지)
+            std::shared_ptr<MysqlSlot> slot = slots_[idx];
+            // Only ping connections idle for more than 30s (avoid pinging every acquire)
             if (slot->needs_liveness_check() && mysql_ping(slot->conn) != 0) {
                 MYSQL* fresh = create_connection(dsn_);
                 if (!fresh) {
@@ -651,14 +700,13 @@ public:
                 slot->conn = fresh;
             }
             active_.fetch_add(1, std::memory_order_relaxed);
-            co_return std::make_unique<MysqlConnection>(
-                slot->conn, slot->mutex, idx, this);
+            co_return std::make_unique<MysqlConnection>(std::move(slot), idx, this);
         }
 
-        // 2. 새 슬롯 생성
+        // 2. create a new slot
         if (slots_.size() < max_size_) {
             const size_t idx = slots_.size();
-            slots_.push_back(nullptr); // 자리 예약
+            slots_.push_back(nullptr); // reserve the index
             lock.unlock();
 
             MYSQL* c = create_connection(dsn_);
@@ -666,28 +714,32 @@ public:
                 lock.lock(); slots_.pop_back();
                 co_return unexpected(db_error(DbError::ConnectionFailed));
             }
-            auto slot = std::make_unique<MysqlSlot>(c);
-            MysqlSlot* raw_slot = slot.get();
+            auto slot = std::make_shared<MysqlSlot>(c);
             lock.lock();
-            slots_[idx] = std::move(slot);
+            slots_[idx] = slot;
             lock.unlock();
             active_.fetch_add(1, std::memory_order_relaxed);
-            co_return std::make_unique<MysqlConnection>(
-                raw_slot->conn, raw_slot->mutex, idx, this);
+            co_return std::make_unique<MysqlConnection>(std::move(slot), idx, this);
         }
 
-        // 3. 풀 소진 → 즉시 에러 (동기 드라이버)
+        // 3. pool exhausted → immediate error (synchronous driver)
         co_return unexpected(db_error(DbError::PoolExhausted));
     }
 
     void release(size_t idx) noexcept {
         active_.fetch_sub(1, std::memory_order_relaxed);
-        slots_[idx]->mark_idle();
         std::lock_guard lock{mutex_};
+        // If the pool was drained while this connection was checked out, its slot
+        // entry is gone — there is nothing to return to the idle list. The
+        // connection's own shared_ptr<MysqlSlot> already owns (and will free) the
+        // underlying MYSQL* + mutex, so no use-after-free occurs.
+        if (idx >= slots_.size() || !slots_[idx]) return;
+        slots_[idx]->mark_idle();
         idle_.push(idx);
     }
 
-    // return_connection은 unique_ptr 소멸 → ~MysqlConnection → release() 경로로 처리
+    // return_connection is handled by the unique_ptr destructor path:
+    // ~MysqlConnection → release().
     void return_connection(std::unique_ptr<IConnection>) noexcept override {}
 
     size_t active_count() const noexcept override {
@@ -710,14 +762,28 @@ private:
     MysqlDsn                                  dsn_;
     size_t                                    max_size_;
     mutable std::mutex                        mutex_;
-    std::vector<std::unique_ptr<MysqlSlot>>   slots_;
+    // shared_ptr so a connection checked out of the pool keeps its MysqlSlot
+    // (MYSQL* + mutex) alive even if drain() clears the pool concurrently —
+    // otherwise a live connection would dereference a freed Slot (use-after-free).
+    std::vector<std::shared_ptr<MysqlSlot>>   slots_;
     std::queue<size_t>                        idle_;
     std::atomic<size_t>                       active_{0};
 };
 
-// ─── MysqlConnection::~MysqlConnection 구현 ──────────────────────────────────
+// ─── MysqlConnection::~MysqlConnection implementation ─────────────────────────
 
 MysqlConnection::~MysqlConnection() {
+    // Roll back a transaction the holder left open (begin() with no commit/
+    // rollback) before the slot returns to the pool, so transaction state never
+    // bleeds into the next user of this pooled connection.  Only touches the wire
+    // when in_txn is set, so the normal path costs no extra round-trip.
+    if (slot_ && slot_->conn) {
+        std::lock_guard lk{slot_->mutex};
+        if (slot_->in_txn) {
+            mysql_query(slot_->conn, "ROLLBACK");
+            slot_->in_txn = false;
+        }
+    }
     if (pool_) pool_->release(slot_idx_);
 }
 
