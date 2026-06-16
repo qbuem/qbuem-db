@@ -113,17 +113,19 @@ struct RedisReadAwaiter {
             [this, h, reactor](int) mutable {
                 char tmp[4096];
                 const ssize_t n = ::read(fd, tmp, sizeof(tmp));
-                if (n <= 0) {
+                if (n > 0) {
+                    parser->feed(tmp, static_cast<size_t>(n));
+                    if (!parser->has_complete()) return; // wait for the rest
+                } else {
                     error = true;
-                    reactor->unregister_event(fd, EventType::Read);
-                    reactor->post([h]() mutable { h.resume(); });
-                    return;
                 }
-                parser->feed(tmp, static_cast<size_t>(n));
-                if (parser->has_complete()) {
-                    reactor->unregister_event(fd, EventType::Read);
-                    reactor->post([h]() mutable { h.resume(); });
-                }
+                // unregister_event destroys THIS lambda (the reactor owns it), so
+                // copy everything still needed to stack locals first and touch no
+                // captured state afterwards — otherwise it is a use-after-free.
+                auto* r      = reactor;
+                auto  handle = h;
+                r->unregister_event(fd, EventType::Read);
+                r->post([handle]() mutable { handle.resume(); });
             });
     }
 
@@ -162,8 +164,12 @@ struct RedisWriteAwaiter {
                     error = true; break;
                 }
                 if (sent >= data.size() || error) {
-                    reactor->unregister_event(fd, EventType::Write);
-                    reactor->post([h]() mutable { h.resume(); });
+                    // See RedisReadAwaiter: unregister_event frees this lambda, so
+                    // copy what we need to locals before calling it.
+                    auto* r      = reactor;
+                    auto  handle = h;
+                    r->unregister_event(fd, EventType::Write);
+                    r->post([handle]() mutable { handle.resume(); });
                 }
             });
     }
@@ -210,19 +216,17 @@ static int connect_tcp(const RedisDsn& dsn) {
 
 struct RedisConnectAwaiter {
     int fd;
-    bool ready{false};
     bool error{false};
 
-    bool await_ready() noexcept {
-        // connect completes immediately for loopback connections
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
-            ready = true;
-            return true;
-        }
-        return false;
-    }
+    // Always wait for the socket to become writable before proceeding.  A
+    // non-blocking connect() returns EINPROGRESS, and getsockopt(SO_ERROR) reads 0
+    // *while still connecting* — so a SO_ERROR fast-path would report "ready"
+    // before the handshake completes.  Writing to a still-connecting socket then
+    // fails (ENOTCONN on macOS/BSD), which surfaced as a spurious ConnectionFailed
+    // on the very first command.  The writable event fires once connect() resolves
+    // (immediately for an already-connected loopback socket), and await_suspend
+    // verifies SO_ERROR at that point.
+    bool await_ready() noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> h) noexcept {
         auto* reactor = Reactor::current();
@@ -232,8 +236,12 @@ struct RedisConnectAwaiter {
                 socklen_t len = sizeof(err);
                 ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
                 error = (err != 0);
-                reactor->unregister_event(fd, EventType::Write);
-                reactor->post([h]() mutable { h.resume(); });
+                // See RedisReadAwaiter: unregister_event frees this lambda, so
+                // copy what we need to locals before calling it.
+                auto* r      = reactor;
+                auto  handle = h;
+                r->unregister_event(fd, EventType::Write);
+                r->post([handle]() mutable { handle.resume(); });
             });
     }
 
