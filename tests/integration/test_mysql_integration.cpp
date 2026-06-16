@@ -17,6 +17,10 @@ int main() {
             dsn ? dsn : default_dsn,
             "CREATE TABLE itest(id BIGINT PRIMARY KEY, name VARCHAR(255))");
         co_await qbuem_db_it::large_value_suite(*driver, dsn ? dsn : default_dsn);
+        co_await qbuem_db_it::orm_suite(
+            *driver, dsn ? dsn : default_dsn, qbuem_routine::orm::Dialect::MySQL,
+            "CREATE TABLE orm_user(id BIGINT AUTO_INCREMENT PRIMARY KEY, "
+            "name VARCHAR(255), age BIGINT)");
         co_await qbuem_db_it::txn_isolation_suite(*driver, dsn ? dsn : default_dsn);
         co_await qbuem_db_it::drain_safety_suite(*driver, dsn ? dsn : default_dsn);
     });

@@ -9,6 +9,7 @@
 #include <qbuem/core/task.hpp>
 #include <qbuem/db/driver.hpp>
 #include <qbuem/db/value.hpp>
+#include "qbuem/db/orm.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -254,6 +255,145 @@ inline Task<void> txn_isolation_suite(IDBDriver& driver, std::string dsn) {
             IT_CHECK(row && row->get(0).get<int64_t>() == 0); // INSERT rolled back
         }
         co_await conn2->query("DROP TABLE IF EXISTS itxn");
+    }
+    co_return;
+}
+
+// ── ORM end-to-end ────────────────────────────────────────────────────────────
+// Entity for the ORM suite. Registered once per test binary via register_table.
+struct OrmUser {
+    int64_t     id{};
+    std::string name;
+    int64_t     age{};
+};
+
+// Drives the generic ORM (qbuem_routine::orm) through full CRUD + a transaction
+// against a real driver, verifying that SQL generation, parameter binding and
+// row mapping all work end-to-end (the ORM was previously only unit-tested at the
+// SQL-string level).  `dialect` must match the driver; `create_sql` supplies the
+// dialect-specific auto-increment DDL.
+inline Task<void> orm_suite(IDBDriver& driver, std::string dsn,
+                            qbuem_routine::orm::Dialect dialect,
+                            std::string create_sql) {
+    namespace orm = qbuem_routine::orm;
+    auto& m = orm::register_table<OrmUser>("orm_user")
+                  .dialect(dialect)
+                  .pk ("id",   &OrmUser::id)
+                  .col("name", &OrmUser::name)
+                  .col("age",  &OrmUser::age);
+
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    co_await conn->query("DROP TABLE IF EXISTS orm_user");
+    IT_CHECK((co_await conn->query(create_sql)).has_value());
+
+    // CREATE — INSERT via the ORM (PK excluded; DB auto-assigns it).
+    OrmUser u{};
+    u.name = "alice";
+    u.age  = 30;
+    int64_t new_id = 0;
+    {
+        auto rs_r = co_await conn->query(m.sql_insert(), m.bind_insert(u));
+        IT_CHECK(rs_r.has_value());
+        if (!rs_r) co_return;
+        auto rs = std::move(*rs_r);
+        if (dialect == orm::Dialect::PostgreSQL) {
+            const IRow* row = co_await rs->next(); // RETURNING *
+            IT_CHECK(row != nullptr);
+            if (row) new_id = m.read_row(*row).id;
+        } else {
+            new_id = static_cast<int64_t>(rs->last_insert_id());
+        }
+    }
+    IT_CHECK(new_id > 0);
+
+    // READ — SELECT by PK, map back to the struct.
+    {
+        auto rs_r = co_await conn->query(m.sql_select_where("id"), m.bind_val(new_id));
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row != nullptr);
+            if (row) {
+                OrmUser got = m.read_row(*row);
+                IT_CHECK(got.id == new_id);
+                IT_CHECK(got.name == "alice");
+                IT_CHECK(got.age == 30);
+            }
+        }
+    }
+
+    // UPDATE — change fields, persist via the ORM, re-read to confirm.
+    u.id   = new_id;
+    u.name = "alice2";
+    u.age  = 31;
+    IT_CHECK((co_await conn->query(m.sql_update_pk(), m.bind_update(u))).has_value());
+    {
+        auto rs_r = co_await conn->query(m.sql_select_where("id"), m.bind_val(new_id));
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row != nullptr);
+            if (row) {
+                OrmUser got = m.read_row(*row);
+                IT_CHECK(got.name == "alice2");
+                IT_CHECK(got.age == 31);
+            }
+        }
+    }
+
+    // COUNT — aggregate via the ORM.
+    {
+        auto rs_r = co_await conn->query(m.sql_count());
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row && row->get(0).get<int64_t>() == 1);
+        }
+    }
+
+    // TRANSACTION — ORM INSERT inside a transaction, then ROLLBACK: must not persist.
+    {
+        auto tx_r = co_await conn->begin();
+        IT_CHECK(tx_r.has_value());
+        if (tx_r) {
+            auto tx = std::move(*tx_r);
+            OrmUser u2{};
+            u2.name = "bob";
+            u2.age  = 40;
+            IT_CHECK((co_await tx->execute(m.sql_insert(), m.bind_insert(u2))).has_value());
+            IT_CHECK((co_await tx->rollback()).has_value());
+        }
+        auto rs_r = co_await conn->query(m.sql_count());
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row && row->get(0).get<int64_t>() == 1); // bob rolled back
+        }
+    }
+
+    // DELETE — remove via the ORM, confirm the table is empty.
+    IT_CHECK((co_await conn->query(m.sql_delete_pk(), m.bind_pk(u))).has_value());
+    {
+        auto rs_r = co_await conn->query(m.sql_count());
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row && row->get(0).get<int64_t>() == 0);
+        }
     }
     co_return;
 }
