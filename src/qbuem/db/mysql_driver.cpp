@@ -382,6 +382,11 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
         return unexpected(db_error(DbError::QueryFailed));
     }
 
+    // Scratch buffer for columns whose value exceeds the bound buffer (see below).
+    // It grows monotonically and is reused across cells; it is deliberately NOT one
+    // of the bound col_bufs.
+    std::vector<char> scratch;
+
     std::vector<std::vector<CellData>> rows;
     int fetch_rc;
     while ((fetch_rc = mysql_stmt_fetch(stmt)) == 0 || fetch_rc == MYSQL_DATA_TRUNCATED) {
@@ -392,14 +397,33 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
                 row.push_back(CellData{});
                 continue;
             }
-            // If the value was truncated, reallocate to its exact length and re-fetch
-            if (fetch_rc == MYSQL_DATA_TRUNCATED || col_lens[i] > col_bufs[i].size()) {
-                col_bufs[i].resize(col_lens[i] + 1);
-                res_binds[i].buffer        = col_bufs[i].data();
-                res_binds[i].buffer_length = col_lens[i];
-                mysql_stmt_fetch_column(stmt, &res_binds[i], i, 0);
+            // The library captured the bound buffer pointers in mysql_stmt_bind_result;
+            // it writes into THOSE on every mysql_stmt_fetch.  We therefore must never
+            // reallocate a bound col_bufs[i] inside this loop — doing so frees a buffer
+            // the library still holds, so the next fetch is a use-after-free.  When a
+            // value was truncated (its true length, reported via col_lens[i], exceeds
+            // the bound buffer), re-fetch the full value into a separate scratch buffer
+            // through a local MYSQL_BIND; the bound buffers stay untouched and valid.
+            if (col_lens[i] > col_bufs[i].size()) {
+                if (scratch.size() < col_lens[i]) scratch.resize(col_lens[i]);
+                MYSQL_BIND    rb{};
+                unsigned long rlen   = 0;
+                MyBool        rnull  = 0;
+                MyBool        rerror = 0;
+                std::memset(&rb, 0, sizeof(rb));
+                rb.buffer_type   = MYSQL_TYPE_STRING;
+                rb.buffer        = scratch.data();
+                rb.buffer_length = col_lens[i];
+                rb.length        = &rlen;
+                rb.is_null       = &rnull;
+                rb.error         = &rerror;
+                if (mysql_stmt_fetch_column(stmt, &rb, i, 0) == 0)
+                    row.push_back(cell_from_text(scratch.data(), col_lens[i], &fields[i]));
+                else
+                    row.push_back(CellData{}); // re-fetch failed → treat as NULL
+            } else {
+                row.push_back(cell_from_text(col_bufs[i].data(), col_lens[i], &fields[i]));
             }
-            row.push_back(cell_from_text(col_bufs[i].data(), col_lens[i], &fields[i]));
         }
         rows.push_back(std::move(row));
     }

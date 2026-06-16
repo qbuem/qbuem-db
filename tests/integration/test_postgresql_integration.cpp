@@ -13,6 +13,8 @@ int main() {
             *driver,
             dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
             "CREATE TABLE itest(id BIGINT PRIMARY KEY, name TEXT)");
+        co_await qbuem_db_it::large_value_suite(
+            *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
         co_await qbuem_db_it::drain_safety_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
     });

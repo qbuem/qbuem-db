@@ -146,6 +146,58 @@ inline Task<void> drain_safety_suite(IDBDriver& driver, std::string dsn) {
     co_return;
 }
 
+// Large-value round-trip: exercises the result path for column values that span
+// (and exceed) the fixed buffer a driver pre-sizes per column.  The MySQL driver
+// binds 256-byte result buffers before store_result knows the real widths, so a
+// value > 256 bytes forces its truncate -> resize -> mysql_stmt_fetch_column
+// re-fetch path; any buffer/length mismatch there surfaces here as an ASan heap
+// overflow or a corrupted (non-byte-exact) read.  DDL is portable across all
+// three SQL backends (BIGINT PRIMARY KEY + TEXT).
+inline Task<void> large_value_suite(IDBDriver& driver, std::string dsn) {
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    co_await conn->query("DROP TABLE IF EXISTS bigtest");
+    IT_CHECK((co_await conn->query(
+        "CREATE TABLE bigtest(id BIGINT PRIMARY KEY, body TEXT)")).has_value());
+
+    // Sizes straddle the 256-byte boundary in both directions so the same result
+    // set mixes re-fetched (truncated) and inline columns row to row.
+    const int sizes[] = {1, 200, 255, 256, 257, 1000, 5000};
+    const int nsizes  = static_cast<int>(sizeof(sizes) / sizeof(sizes[0]));
+    for (int i = 0; i < nsizes; ++i) {
+        std::string body(static_cast<size_t>(sizes[i]),
+                         static_cast<char>('A' + (sizes[i] % 26)));
+        const Value row[] = {Value{int64_t{i + 1}}, Value{std::string_view{body}}};
+        IT_CHECK((co_await conn->query(
+            "INSERT INTO bigtest(id, body) VALUES($1, $2)", row)).has_value());
+    }
+
+    auto rs_r = co_await conn->query("SELECT id, body FROM bigtest ORDER BY id");
+    IT_CHECK(rs_r.has_value());
+    if (rs_r) {
+        auto rs  = std::move(*rs_r);
+        int  idx = 0;
+        while (const IRow* r = co_await rs->next()) {
+            if (idx >= nsizes) { IT_CHECK(false); break; }
+            const std::string expect(static_cast<size_t>(sizes[idx]),
+                                     static_cast<char>('A' + (sizes[idx] % 26)));
+            IT_CHECK(r->get(0).get<int64_t>() == idx + 1);
+            IT_CHECK(r->get(1).get<std::string_view>() == expect); // byte-exact
+            ++idx;
+        }
+        IT_CHECK(idx == nsizes); // every row returned
+    }
+    co_return;
+}
+
 // Run `body` to completion; returns process exit code (0 = all checks passed).
 template <typename F>
 inline int run_main(F&& body) {

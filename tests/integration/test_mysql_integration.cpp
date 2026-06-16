@@ -16,6 +16,7 @@ int main() {
             *driver,
             dsn ? dsn : default_dsn,
             "CREATE TABLE itest(id BIGINT PRIMARY KEY, name VARCHAR(255))");
+        co_await qbuem_db_it::large_value_suite(*driver, dsn ? dsn : default_dsn);
         co_await qbuem_db_it::drain_safety_suite(*driver, dsn ? dsn : default_dsn);
     });
 }
