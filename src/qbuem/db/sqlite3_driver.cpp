@@ -435,7 +435,8 @@ private:
 // that case the pool collapses to a single connection (max_size = 1).
 
 // Opens one sqlite3* and applies the standard pragmas. Returns nullptr on failure.
-static sqlite3* open_sqlite_connection(const std::string& path) {
+static sqlite3* open_sqlite_connection(const std::string& path,
+                                       unsigned busy_timeout_ms = 5000) {
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
                     | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI;
     sqlite3* db = nullptr;
@@ -446,7 +447,7 @@ static sqlite3* open_sqlite_connection(const std::string& path) {
     // Wait (instead of failing immediately with SQLITE_BUSY) when another
     // writer holds the lock — essential under WAL with concurrent writers,
     // otherwise transient contention surfaces as hard query failures.
-    sqlite3_busy_timeout(db, 5000); // 5s
+    sqlite3_busy_timeout(db, static_cast<int>(busy_timeout_ms)); // lock-wait timeout
     // WAL mode: allows concurrent readers, serializes writers
     sqlite3_exec(db, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);
@@ -474,7 +475,11 @@ static bool is_private_memory(std::string_view path) {
 class SqliteConnectionPool final : public IConnectionPool {
 public:
     SqliteConnectionPool(std::string path, PoolConfig config)
-        : path_(std::move(path)) {
+        : path_(std::move(path))
+        // query_timeout_ms maps to SQLite's busy-timeout (how long a contended
+        // writer waits for a lock before SQLITE_BUSY → LockTimeout). 0 = use the
+        // 5s default rather than failing instantly.
+        , busy_timeout_ms_(config.query_timeout_ms > 0 ? config.query_timeout_ms : 5000) {
         // A private in-memory DB can only ever be a single connection.
         const bool single = is_private_memory(path_);
         max_size_ = single ? 1 : (config.max_size > 0 ? config.max_size : 16);
@@ -483,7 +488,7 @@ public:
 
         std::lock_guard lock{mutex_};
         for (size_t i = 0; i < min_sz; ++i) {
-            sqlite3* c = open_sqlite_connection(path_);
+            sqlite3* c = open_sqlite_connection(path_, busy_timeout_ms_);
             if (!c) break;
             idle_.push(slots_.size());
             slots_.push_back(std::make_shared<SqliteSlot>(c));
@@ -512,7 +517,7 @@ public:
             slots_.push_back(nullptr); // reserve the index
             lock.unlock();
 
-            sqlite3* c = open_sqlite_connection(path_);
+            sqlite3* c = open_sqlite_connection(path_, busy_timeout_ms_);
             if (!c) {
                 lock.lock(); slots_.pop_back();
                 co_return unexpected(db_error(DbError::ConnectionFailed));
@@ -561,6 +566,7 @@ public:
 
 private:
     std::string                              path_;
+    unsigned                                 busy_timeout_ms_{5000};
     size_t                                   max_size_{1};
     mutable std::mutex                       mutex_;
     // shared_ptr so a checked-out connection keeps its SqliteSlot (sqlite3* +

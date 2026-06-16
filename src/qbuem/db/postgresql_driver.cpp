@@ -356,6 +356,7 @@ static DbError pg_transient_or(PGresult* res, DbError fallback) {
         if (s == "40001") return DbError::SerializationFailure; // serialization_failure
         if (s == "40P01") return DbError::Deadlock;             // deadlock_detected
         if (s == "55P03") return DbError::LockTimeout;          // lock_not_available
+        if (s == "57014") return DbError::StatementTimeout;     // query_canceled (timeout)
     }
     return fallback;
 }
@@ -826,6 +827,15 @@ public:
     PgConnectionPool(std::string conninfo, PoolConfig config)
         : conninfo_(std::move(conninfo))
         , max_size_(config.max_size > 0 ? config.max_size : 16) {
+        // Enforce the query timeout server-side: thread `statement_timeout` into
+        // the connection URI's `options` parameter so every (re)connect from this
+        // pool inherits it. A runaway query is then cancelled by the server
+        // (SQLSTATE 57014 → StatementTimeout) instead of hanging the caller.
+        if (config.query_timeout_ms > 0) {
+            conninfo_ += (conninfo_.find('?') == std::string::npos) ? '?' : '&';
+            conninfo_ += "options=-c%20statement_timeout%3D";
+            conninfo_ += std::to_string(config.query_timeout_ms);
+        }
         const size_t min_sz = config.min_size > 0 ? config.min_size : 2;
         std::lock_guard lock{mutex_};
         for (size_t i = 0; i < min_sz; ++i) {
