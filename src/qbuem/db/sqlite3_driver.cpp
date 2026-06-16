@@ -1,5 +1,6 @@
 #include "sqlite3_driver.hpp"
 #include "db_error.hpp"
+#include "sql_placeholders.hpp"
 
 #include <sqlite3.h>
 #include <qbuem/core/task.hpp>
@@ -18,23 +19,8 @@ using namespace qbuem::db;
 namespace qbuem_routine {
 namespace {
 
-// ─── $N → ? 플레이스홀더 변환 (ORM 호환) ─────────────────────────────────────
-
-static std::string convert_placeholders(std::string_view sql) {
-    std::string result;
-    result.reserve(sql.size());
-    std::size_t i = 0;
-    while (i < sql.size()) {
-        if (sql[i] == '$' && i + 1 < sql.size() && std::isdigit(sql[i + 1])) {
-            result += '?';
-            ++i;
-            while (i < sql.size() && std::isdigit(sql[i])) ++i;
-        } else {
-            result += sql[i++];
-        }
-    }
-    return result;
-}
+// $N → ? placeholder conversion: shared, string-literal-aware implementation.
+using qbuem_routine::db_detail::convert_placeholders;
 
 // ─── CellData — 단일 컬럼 값 저장 ───────────────────────────────────────────
 
@@ -280,10 +266,14 @@ public:
     }
 
     Task<Result<void>> savepoint(std::string_view name) override {
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return exec_sql("SAVEPOINT " + std::string(name));
     }
 
     Task<Result<void>> rollback_to(std::string_view name) override {
+        if (!db_detail::is_safe_ident(name))
+            co_return unexpected(db_error(DbError::QueryFailed));
         co_return exec_sql("ROLLBACK TO " + std::string(name));
     }
 
@@ -403,6 +393,10 @@ public:
             db_ = nullptr;
             return;
         }
+        // Wait (instead of failing immediately with SQLITE_BUSY) when another
+        // writer holds the lock — essential under WAL with concurrent writers,
+        // otherwise transient contention surfaces as hard query failures.
+        sqlite3_busy_timeout(db_, 5000); // 5s
         // WAL 모드: 동시 읽기 허용, 쓰기 직렬화
         sqlite3_exec(db_, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
         sqlite3_exec(db_, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);

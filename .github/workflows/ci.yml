@@ -44,7 +44,7 @@ jobs:
         run: |
           set -e
           INC="-Isrc -I_stack/include"
-          for t in test_resp_parser test_orm; do
+          for t in test_resp_parser test_orm test_placeholders; do
             echo "::group::$t"
             g++ -std=c++23 ${{ matrix.flags }} $INC tests/$t.cpp -o $t
             ./$t
