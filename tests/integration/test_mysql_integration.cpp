@@ -29,6 +29,9 @@ int main() {
         co_await qbuem_db_it::with_transaction_suite(
             *driver, dsn ? dsn : default_dsn,
             "CREATE TABLE wtx(id BIGINT PRIMARY KEY, n BIGINT)");
+        co_await qbuem_db_it::streaming_suite(
+            *driver, dsn ? dsn : default_dsn,
+            "CREATE TABLE strm(id BIGINT PRIMARY KEY, n BIGINT)");
         // MySQL applies the configured timeout as the session max_execution_time
         // (+ a MYSQL_OPT_READ_TIMEOUT network backstop). Enforcement over the
         // prepared-statement protocol is a known MySQL limitation, so verify the

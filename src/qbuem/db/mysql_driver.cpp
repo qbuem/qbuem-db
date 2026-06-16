@@ -240,6 +240,147 @@ private:
     uint64_t                                  last_id_;
 };
 
+// ─── Forward declaration ──────────────────────────────────────────────────────
+
+class MysqlConnectionPool;
+
+// ─── Slot ─────────────────────────────────────────────────────────────────────
+// Owns one MYSQL* + its serializing mutex.  Held via shared_ptr so a connection
+// (and its statements/transactions/result sets) checked out of the pool keeps the
+// slot alive even if drain() clears the pool concurrently — otherwise a live
+// handle would touch a freed MYSQL/mutex (use-after-free).
+
+struct MysqlSlot {
+    using Clock = std::chrono::steady_clock;
+
+    MYSQL*             conn{nullptr};
+    std::mutex         mutex;
+    Clock::time_point  idle_since{Clock::now()};
+    // Set when begin() opens a transaction, cleared on commit()/rollback().  Lets
+    // the connection destructor roll back a transaction the holder left open so it
+    // never bleeds into the next user of this pooled connection.  (libmysqlclient
+    // exposes no public "in transaction?" query, hence this explicit flag.)
+    bool               in_txn{false};
+
+    explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
+    ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
+
+    MysqlSlot(const MysqlSlot&)            = delete;
+    MysqlSlot& operator=(const MysqlSlot&) = delete;
+
+    void mark_idle() noexcept { idle_since = Clock::now(); }
+
+    bool needs_liveness_check() const noexcept {
+        // Only ping connections that have been idle for more than 30s
+        return (Clock::now() - idle_since) > std::chrono::seconds{30};
+    }
+};
+
+// ─── Streaming ResultSet ──────────────────────────────────────────────────────
+// Lazy, bounded-memory result for SELECTs from conn->query(): the statement uses
+// a read-only server-side cursor (no client-side store_result), and next() pulls
+// one row at a time via mysql_stmt_fetch. Owns its MYSQL_STMT + MYSQL_RES (closed
+// on exhaustion or destruction, so abandoning a partial scan is safe) and holds a
+// shared_ptr<MysqlSlot> keepalive. Bound result buffers are members (never
+// reallocated after bind), with oversized columns re-fetched into a scratch
+// buffer — same invariant as the buffered path.
+
+class MysqlStreamResultSet final : public IResultSet {
+public:
+    MysqlStreamResultSet(std::shared_ptr<MysqlSlot> slot, MYSQL_STMT* stmt,
+                         MYSQL_RES* meta,
+                         std::shared_ptr<std::vector<std::string>> col_names,
+                         uint64_t affected, uint64_t last_id)
+        : slot_(std::move(slot)), stmt_(stmt), meta_(meta),
+          fields_(mysql_fetch_fields(meta)), col_names_(std::move(col_names)),
+          ncols_(mysql_num_fields(meta)), affected_(affected), last_id_(last_id),
+          res_binds_(ncols_), col_bufs_(ncols_), col_lens_(ncols_, 0),
+          col_nulls_(std::make_unique<MyBool[]>(ncols_)) {}
+
+    ~MysqlStreamResultSet() override { cleanup(); }
+
+    MysqlStreamResultSet(const MysqlStreamResultSet&)            = delete;
+    MysqlStreamResultSet& operator=(const MysqlStreamResultSet&) = delete;
+
+    // Bind the member result buffers to the statement (once, before fetching).
+    // Members are stable for our lifetime, so the captured pointers stay valid.
+    [[nodiscard]] bool bind() {
+        for (unsigned int i = 0; i < ncols_; ++i) {
+            auto& b = res_binds_[i];
+            std::memset(&b, 0, sizeof(b));
+            const unsigned long init_sz =
+                fields_[i].max_length > 0 ? fields_[i].max_length + 1 : 256;
+            col_bufs_[i].resize(init_sz);
+            b.buffer_type   = MYSQL_TYPE_STRING;
+            b.buffer        = col_bufs_[i].data();
+            b.buffer_length = static_cast<unsigned long>(col_bufs_[i].size());
+            b.length        = &col_lens_[i];
+            b.is_null       = &col_nulls_[i];
+        }
+        return ncols_ == 0 || mysql_stmt_bind_result(stmt_, res_binds_.data()) == 0;
+    }
+
+    Task<const IRow*> next() override {
+        std::lock_guard lock{slot_->mutex};
+        if (!stmt_) co_return nullptr;
+        const int fetch_rc = mysql_stmt_fetch(stmt_);
+        if (fetch_rc != 0 && fetch_rc != MYSQL_DATA_TRUNCATED) {
+            cleanup(); // MYSQL_NO_DATA (100) or error → end of stream
+            co_return nullptr;
+        }
+        std::vector<CellData> row;
+        row.reserve(ncols_);
+        for (unsigned int i = 0; i < ncols_; ++i) {
+            if (col_nulls_[i]) { row.push_back(CellData{}); continue; }
+            if (col_lens_[i] > col_bufs_[i].size()) {
+                if (scratch_.size() < col_lens_[i]) scratch_.resize(col_lens_[i]);
+                MYSQL_BIND    rb{};
+                unsigned long rlen   = 0;
+                MyBool        rnull  = 0;
+                MyBool        rerror = 0;
+                std::memset(&rb, 0, sizeof(rb));
+                rb.buffer_type   = MYSQL_TYPE_STRING;
+                rb.buffer        = scratch_.data();
+                rb.buffer_length = col_lens_[i];
+                rb.length        = &rlen;
+                rb.is_null       = &rnull;
+                rb.error         = &rerror;
+                if (mysql_stmt_fetch_column(stmt_, &rb, i, 0) == 0)
+                    row.push_back(cell_from_text(scratch_.data(), col_lens_[i], &fields_[i]));
+                else
+                    row.push_back(CellData{});
+            } else {
+                row.push_back(cell_from_text(col_bufs_[i].data(), col_lens_[i], &fields_[i]));
+            }
+        }
+        current_ = std::make_unique<MysqlRow>(col_names_, std::move(row));
+        co_return current_.get();
+    }
+
+    uint64_t affected_rows()  const noexcept override { return affected_; }
+    uint64_t last_insert_id() const noexcept override { return last_id_; }
+
+private:
+    void cleanup() noexcept {
+        if (meta_) { mysql_free_result(meta_); meta_ = nullptr; }
+        if (stmt_) { mysql_stmt_close(stmt_); stmt_ = nullptr; }
+    }
+
+    std::shared_ptr<MysqlSlot>                slot_; // keepalive
+    MYSQL_STMT*                               stmt_;
+    MYSQL_RES*                                meta_;
+    MYSQL_FIELD*                              fields_;
+    std::shared_ptr<std::vector<std::string>> col_names_;
+    unsigned int                              ncols_;
+    uint64_t                                  affected_, last_id_;
+    std::vector<MYSQL_BIND>                   res_binds_;
+    std::vector<std::vector<char>>            col_bufs_;
+    std::vector<unsigned long>                col_lens_;
+    std::unique_ptr<MyBool[]>                 col_nulls_;
+    std::vector<char>                         scratch_;
+    std::unique_ptr<MysqlRow>                 current_;
+};
+
 // ─── Connection-creation helper ───────────────────────────────────────────────
 
 static MYSQL* create_connection(const MysqlDsn& dsn, unsigned query_timeout_ms = 0) {
@@ -498,41 +639,96 @@ exec_query(MYSQL* conn, std::string_view sql, std::span<const Value> params) {
     return result;
 }
 
-// ─── Forward declaration ──────────────────────────────────────────────────────
+// ─── Streaming query helper (prepare → execute → stream rows) ─────────────────
+// One-shot statement owned by the returned MysqlStreamResultSet. DML (no result
+// set) is executed eagerly and returned as a buffered empty result; SELECTs use a
+// read-only server-side cursor and stream rows lazily.
+static Result<std::unique_ptr<IResultSet>>
+exec_query_streaming(std::shared_ptr<MysqlSlot> slot, std::string_view sql,
+                     std::span<const Value> params) {
+    const auto converted = convert_placeholders(sql);
 
-class MysqlConnectionPool;
+    MYSQL_STMT* stmt = mysql_stmt_init(slot->conn);
+    if (!stmt) return unexpected(db_error(DbError::QueryFailed));
 
-// ─── Slot ─────────────────────────────────────────────────────────────────────
-// Owns one MYSQL* + its serializing mutex.  Held via shared_ptr so a connection
-// (and its statements/transactions) checked out of the pool keeps the slot alive
-// even if drain() clears the pool concurrently — otherwise a live handle would
-// touch a freed MYSQL/mutex (use-after-free).
-
-struct MysqlSlot {
-    using Clock = std::chrono::steady_clock;
-
-    MYSQL*             conn{nullptr};
-    std::mutex         mutex;
-    Clock::time_point  idle_since{Clock::now()};
-    // Set when begin() opens a transaction, cleared on commit()/rollback().  Lets
-    // the connection destructor roll back a transaction the holder left open so it
-    // never bleeds into the next user of this pooled connection.  (libmysqlclient
-    // exposes no public "in transaction?" query, hence this explicit flag.)
-    bool               in_txn{false};
-
-    explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
-    ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
-
-    MysqlSlot(const MysqlSlot&)            = delete;
-    MysqlSlot& operator=(const MysqlSlot&) = delete;
-
-    void mark_idle() noexcept { idle_since = Clock::now(); }
-
-    bool needs_liveness_check() const noexcept {
-        // Only ping connections that have been idle for more than 30s
-        return (Clock::now() - idle_since) > std::chrono::seconds{30};
+    if (mysql_stmt_prepare(stmt, converted.c_str(),
+                           static_cast<unsigned long>(converted.size()))) {
+        const DbError e = mysql_stmt_transient_or(stmt, DbError::QueryFailed);
+        mysql_stmt_close(stmt);
+        return unexpected(db_error(e));
     }
-};
+
+    // Read-only server-side cursor for result-producing statements so rows are
+    // streamed rather than buffered client-side. (field_count==0 → DML, no cursor.)
+    if (mysql_stmt_field_count(stmt) > 0) {
+        unsigned long cursor_type = CURSOR_TYPE_READ_ONLY;
+        mysql_stmt_attr_set(stmt, STMT_ATTR_CURSOR_TYPE, &cursor_type);
+    }
+
+    // Bind parameters (zero-copy; num_bufs/binds outlive execute()).
+    std::vector<ParamBuf>   num_bufs(params.size());
+    std::vector<MYSQL_BIND> binds(params.size());
+    for (std::size_t i = 0; i < params.size(); ++i) {
+        auto& b = binds[i]; auto& buf = num_bufs[i]; const auto& v = params[i];
+        std::memset(&b, 0, sizeof(b));
+        switch (v.type()) {
+            case Value::Type::Null: b.buffer_type = MYSQL_TYPE_NULL; break;
+            case Value::Type::Bool:
+            case Value::Type::Int64:
+                buf.i64 = v.get<int64_t>(); b.buffer_type = MYSQL_TYPE_LONGLONG;
+                b.buffer = &buf.i64; b.buffer_length = sizeof(int64_t); break;
+            case Value::Type::Float64:
+                buf.f64 = v.get<double>(); b.buffer_type = MYSQL_TYPE_DOUBLE;
+                b.buffer = &buf.f64; b.buffer_length = sizeof(double); break;
+            case Value::Type::Text: {
+                auto sv = v.get<std::string_view>();
+                b.buffer_type = MYSQL_TYPE_STRING;
+                b.buffer = const_cast<void*>(static_cast<const void*>(sv.data()));
+                b.buffer_length = static_cast<unsigned long>(sv.size()); break;
+            }
+            case Value::Type::Blob: {
+                auto bv = v.get<BufferView>();
+                b.buffer_type = MYSQL_TYPE_BLOB;
+                b.buffer = const_cast<void*>(static_cast<const void*>(bv.data()));
+                b.buffer_length = static_cast<unsigned long>(bv.size()); break;
+            }
+        }
+    }
+    if (!params.empty() && mysql_stmt_bind_param(stmt, binds.data())) {
+        mysql_stmt_close(stmt);
+        return unexpected(db_error(DbError::QueryFailed));
+    }
+
+    if (mysql_stmt_execute(stmt)) { // eager — DML side effects happen here
+        const DbError e = mysql_stmt_transient_or(stmt, DbError::QueryFailed);
+        mysql_stmt_close(stmt);
+        return unexpected(db_error(e));
+    }
+
+    const uint64_t affected = static_cast<uint64_t>(mysql_stmt_affected_rows(stmt));
+    const uint64_t last_id  = static_cast<uint64_t>(mysql_stmt_insert_id(stmt));
+
+    MYSQL_RES* meta = mysql_stmt_result_metadata(stmt);
+    if (!meta) { // no result set (DML) — buffered empty result
+        mysql_stmt_close(stmt);
+        return std::make_unique<MysqlResultSet>(
+            std::vector<std::vector<CellData>>{},
+            std::make_shared<std::vector<std::string>>(), affected, last_id);
+    }
+
+    const unsigned int ncols  = mysql_num_fields(meta);
+    MYSQL_FIELD*       fields = mysql_fetch_fields(meta);
+    auto col_names = std::make_shared<std::vector<std::string>>();
+    col_names->reserve(ncols);
+    for (unsigned int i = 0; i < ncols; ++i)
+        col_names->emplace_back(fields[i].name ? fields[i].name : "");
+
+    auto rs = std::make_unique<MysqlStreamResultSet>(
+        std::move(slot), stmt, meta, std::move(col_names), affected, last_id);
+    if (!rs->bind()) // rs destructor frees meta + closes stmt
+        return unexpected(db_error(DbError::QueryFailed));
+    return rs;
+}
 
 // ─── Statement ────────────────────────────────────────────────────────────────
 // Holds a shared_ptr<MysqlSlot> keepalive (so the MYSQL*/mutex outlive it); db_
@@ -657,7 +853,7 @@ public:
     Task<Result<std::unique_ptr<IResultSet>>>
     query(std::string_view sql, std::span<const Value> params) override {
         std::lock_guard lock{mx_};
-        co_return exec_query(db_, sql, params);
+        co_return exec_query_streaming(slot_, sql, params);
     }
 
     Task<Result<std::unique_ptr<ITransaction>>>

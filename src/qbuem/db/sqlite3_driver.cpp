@@ -245,6 +245,59 @@ struct SqliteSlot {
     SqliteSlot& operator=(const SqliteSlot&) = delete;
 };
 
+// ─── Streaming ResultSet ──────────────────────────────────────────────────────
+// Lazy, bounded-memory result for SELECTs from conn->query(): owns its one-shot
+// sqlite3_stmt and reads exactly one row per next() via sqlite3_step, instead of
+// buffering every row up front. Holds a shared_ptr<SqliteSlot> keepalive so the
+// connection/mutex outlive it; the stmt is finalized when the rows are exhausted
+// or the result set is destroyed. (DML statements — column_count()==0 — are run
+// eagerly and returned as a buffered empty SqliteResultSet, so side effects still
+// happen at query() time, not lazily on next().)
+
+class SqliteStreamResultSet final : public IResultSet {
+public:
+    SqliteStreamResultSet(std::shared_ptr<SqliteSlot> slot, sqlite3_stmt* stmt,
+                          std::shared_ptr<std::vector<std::string>> col_names)
+        : slot_(std::move(slot)), stmt_(stmt), col_names_(std::move(col_names)) {}
+
+    ~SqliteStreamResultSet() override {
+        if (stmt_) {
+            std::lock_guard lock{slot_->mutex};
+            sqlite3_finalize(stmt_);
+        }
+    }
+
+    SqliteStreamResultSet(const SqliteStreamResultSet&)            = delete;
+    SqliteStreamResultSet& operator=(const SqliteStreamResultSet&) = delete;
+
+    Task<const IRow*> next() override {
+        std::lock_guard lock{slot_->mutex};
+        if (!stmt_) co_return nullptr;
+        const int rc = sqlite3_step(stmt_);
+        if (rc == SQLITE_ROW) {
+            const int ncols = static_cast<int>(col_names_->size());
+            std::vector<CellData> row;
+            row.reserve(static_cast<size_t>(ncols));
+            for (int i = 0; i < ncols; ++i) row.push_back(read_column(stmt_, i));
+            current_ = std::make_unique<SqliteRow>(col_names_, std::move(row));
+            co_return current_.get();
+        }
+        // SQLITE_DONE or error → end of stream; release the statement now.
+        sqlite3_finalize(stmt_);
+        stmt_ = nullptr;
+        co_return nullptr;
+    }
+
+    uint64_t affected_rows()  const noexcept override { return 0; } // SELECT
+    uint64_t last_insert_id() const noexcept override { return 0; }
+
+private:
+    std::shared_ptr<SqliteSlot>               slot_; // keepalive
+    sqlite3_stmt*                             stmt_;
+    std::shared_ptr<std::vector<std::string>> col_names_;
+    std::unique_ptr<SqliteRow>                current_;
+};
+
 // ─── Statement ────────────────────────────────────────────────────────────────
 // Holds a shared_ptr<SqliteSlot> keepalive (so the sqlite3*/mutex outlive it);
 // db_ and mx_ are cached from the slot for unchanged method bodies.
@@ -388,9 +441,37 @@ public:
                                     static_cast<int>(converted.size()), &stmt, nullptr);
         if (rc != SQLITE_OK || !stmt)
             co_return unexpected(db_error(DbError::QueryFailed));
-        auto result = run_stmt(db_, stmt, params);
-        sqlite3_finalize(stmt);
-        co_return result;
+
+        for (int i = 0; i < static_cast<int>(params.size()); ++i)
+            bind_value(stmt, i + 1, params[i]);
+
+        const int ncols = sqlite3_column_count(stmt);
+        if (ncols == 0) {
+            // DML / non-row statement: execute eagerly so side effects happen now,
+            // not lazily on a next() that may never be called.
+            rc = sqlite3_step(stmt);
+            if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+                const DbError e = sqlite_transient_or(rc, DbError::QueryFailed);
+                sqlite3_finalize(stmt);
+                co_return unexpected(db_error(e));
+            }
+            const uint64_t affected = static_cast<uint64_t>(sqlite3_changes(db_));
+            const uint64_t last_id  = static_cast<uint64_t>(sqlite3_last_insert_rowid(db_));
+            sqlite3_finalize(stmt);
+            co_return std::make_unique<SqliteResultSet>(
+                std::vector<std::vector<CellData>>{},
+                std::make_shared<std::vector<std::string>>(), affected, last_id);
+        }
+
+        // SELECT (has result columns): stream rows lazily — the result set owns the
+        // statement and reads one row per next(), bounding memory for large scans.
+        auto col_names = std::make_shared<std::vector<std::string>>();
+        col_names->reserve(static_cast<size_t>(ncols));
+        for (int i = 0; i < ncols; ++i) {
+            const char* name = sqlite3_column_name(stmt, i);
+            col_names->emplace_back(name ? name : "");
+        }
+        co_return std::make_unique<SqliteStreamResultSet>(slot_, stmt, std::move(col_names));
     }
 
     Task<Result<std::unique_ptr<ITransaction>>>

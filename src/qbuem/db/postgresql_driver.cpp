@@ -422,12 +422,17 @@ struct PgReadAwaiter {
 
     PGconn*   conn;
     PGresult* result{nullptr};
+    // When true (default), discard any results after the first — correct for the
+    // one-result-per-query buffered path. Single-row streaming sets this false so
+    // each await yields exactly one row-result (PGRES_SINGLE_TUPLE).
+    bool      drain_trailing{true};
 
     bool await_ready() noexcept {
         PQconsumeInput(conn);
         if (PQisBusy(conn)) return false;
         result = PQgetResult(conn);
-        while (PGresult* r = PQgetResult(conn)) PQclear(r); // drain trailing results
+        if (drain_trailing)
+            while (PGresult* r = PQgetResult(conn)) PQclear(r); // drain trailing results
         return true;
     }
 
@@ -462,7 +467,8 @@ struct PgReadAwaiter {
                     if (!PQisBusy(pga->conn)) {
                         // Collect the result BEFORE unregistering (closure still valid).
                         pga->result = PQgetResult(pga->conn);
-                        while (PGresult* r = PQgetResult(pga->conn)) PQclear(r);
+                        if (pga->drain_trailing)
+                            while (PGresult* r = PQgetResult(pga->conn)) PQclear(r);
                         // unregister_event may free this closure — use stack-locals only below.
                         lreactor->unregister_event(lfd, EventType::Read);
                         lreactor->post([lh]() mutable { lh.resume(); });
@@ -585,6 +591,77 @@ struct Slot {
     [[nodiscard]] bool needs_liveness_check() const noexcept {
         return (Clock::now() - idle_since) > std::chrono::seconds{30};
     }
+};
+
+// ─── Streaming ResultSet ──────────────────────────────────────────────────────
+// Lazy, bounded-memory result for SELECTs from conn->query(): the query runs in
+// libpq single-row mode, so the server streams rows one at a time and next()
+// pulls one PGRES_SINGLE_TUPLE per call (holding only the current row) instead of
+// buffering the whole result. The first row is fetched eagerly by query() (so the
+// statement is executed there); subsequent rows stream here. Holds a
+// shared_ptr<Slot> keepalive. If a scan is abandoned mid-stream, the destructor
+// cancels the query and drains the remaining results so the pooled connection is
+// clean for its next user.
+
+class PgStreamResultSet final : public IResultSet {
+public:
+    PgStreamResultSet(std::shared_ptr<Slot> slot,
+                      std::shared_ptr<std::vector<std::string>> col_names,
+                      int ncols, std::vector<CellData> first_row)
+        : slot_(std::move(slot)), col_names_(std::move(col_names)),
+          ncols_(ncols), pending_(std::move(first_row)), has_pending_(true) {}
+
+    ~PgStreamResultSet() override {
+        if (done_ || !slot_) return;
+        std::lock_guard lk{slot_->mutex};
+        PGconn* c = slot_->conn;
+        if (PGcancel* cancel = PQgetCancel(c)) {
+            char errbuf[256];
+            PQcancel(cancel, errbuf, sizeof errbuf);
+            PQfreeCancel(cancel);
+        }
+        while (PGresult* r = PQgetResult(c)) PQclear(r); // drain (bounded by cancel)
+    }
+
+    PgStreamResultSet(const PgStreamResultSet&)            = delete;
+    PgStreamResultSet& operator=(const PgStreamResultSet&) = delete;
+
+    Task<const IRow*> next() override {
+        if (has_pending_) {
+            has_pending_ = false;
+            current_ = std::make_unique<PgRow>(col_names_, std::move(pending_));
+            co_return current_.get();
+        }
+        if (done_) co_return nullptr;
+        // One result per await (drain_trailing=false), i.e. one streamed row.
+        PGresult* res = co_await PgReadAwaiter{slot_->conn, nullptr, false};
+        if (res && PQresultStatus(res) == PGRES_SINGLE_TUPLE) {
+            std::vector<CellData> row;
+            row.reserve(static_cast<size_t>(ncols_));
+            for (int c = 0; c < ncols_; ++c)
+                row.push_back(read_pg_column_binary(res, 0, c));
+            PQclear(res);
+            current_ = std::make_unique<PgRow>(col_names_, std::move(row));
+            co_return current_.get();
+        }
+        // PGRES_TUPLES_OK (normal end), error, or null → stream finished.
+        if (res) PQclear(res);
+        while (PGresult* r = PQgetResult(slot_->conn)) PQclear(r); // consume terminator
+        done_ = true;
+        co_return nullptr;
+    }
+
+    uint64_t affected_rows()  const noexcept override { return 0; } // SELECT
+    uint64_t last_insert_id() const noexcept override { return 0; }
+
+private:
+    std::shared_ptr<Slot>                     slot_; // keepalive
+    std::shared_ptr<std::vector<std::string>> col_names_;
+    int                                       ncols_;
+    std::vector<CellData>                     pending_;
+    bool                                      has_pending_{false};
+    bool                                      done_{false};
+    std::unique_ptr<PgRow>                    current_;
 };
 
 // ─── PgAcquireAwaiter — wait when pool is exhausted ──────────────────────────
@@ -753,18 +830,62 @@ public:
     Task<Result<std::unique_ptr<IResultSet>>>
     query(std::string_view sql, std::span<const Value> params) override {
         PgParams pg; pg.build(params);
-        PGresult* res;
         {
             std::lock_guard lock{slot_->mutex};
             if (PQsendQueryParams(slot_->conn, std::string(sql).c_str(),
                                   pg.n(), nullptr,
                                   pg.values(), pg.lengths(), pg.formats(), 1) == 0)
                 co_return unexpected(db_error(DbError::QueryFailed));
+            // Stream rows one at a time instead of buffering the whole result.
+            PQsetSingleRowMode(slot_->conn);
         }
         if (!co_await async_flush(slot_->conn)) co_return unexpected(db_error(DbError::QueryFailed));
-        res = co_await PgReadAwaiter{slot_->conn};
+
+        // Eagerly fetch the first result: this executes the statement (DML side
+        // effects happen now) and tells us whether rows follow.
+        PGresult* res = co_await PgReadAwaiter{slot_->conn, nullptr, false};
         if (!res) co_return unexpected(db_error(DbError::QueryFailed));
-        co_return build_result_set(res);
+        const ExecStatusType st = PQresultStatus(res);
+
+        auto col_names_of = [](PGresult* r) {
+            auto cn = std::make_shared<std::vector<std::string>>();
+            const int nc = PQnfields(r);
+            cn->reserve(static_cast<size_t>(nc));
+            for (int i = 0; i < nc; ++i) cn->emplace_back(PQfname(r, i) ? PQfname(r, i) : "");
+            return cn;
+        };
+        auto drain = [&] { while (PGresult* r = PQgetResult(slot_->conn)) PQclear(r); };
+
+        if (st == PGRES_SINGLE_TUPLE) {
+            // SELECT with rows: keep the first row, stream the rest lazily.
+            const int ncols = PQnfields(res);
+            auto col_names  = col_names_of(res);
+            std::vector<CellData> first;
+            first.reserve(static_cast<size_t>(ncols));
+            for (int c = 0; c < ncols; ++c) first.push_back(read_pg_column_binary(res, 0, c));
+            PQclear(res);
+            co_return std::make_unique<PgStreamResultSet>(
+                slot_, std::move(col_names), ncols, std::move(first));
+        }
+        if (st == PGRES_TUPLES_OK) { // SELECT returning zero rows
+            auto col_names = col_names_of(res);
+            PQclear(res); drain();
+            co_return std::make_unique<PgResultSet>(
+                std::vector<std::vector<CellData>>{}, std::move(col_names), 0, 0);
+        }
+        if (st == PGRES_COMMAND_OK) { // DML — affected available immediately
+            uint64_t affected = 0;
+            if (const char* tag = PQcmdTuples(res); tag && *tag)
+                std::from_chars(tag, tag + std::strlen(tag), affected);
+            PQclear(res); drain();
+            co_return std::make_unique<PgResultSet>(
+                std::vector<std::vector<CellData>>{},
+                std::make_shared<std::vector<std::string>>(), affected, 0);
+        }
+        // Error (incl. transient): classify, drain, surface.
+        const DbError e = pg_transient_or(res, DbError::QueryFailed);
+        PQclear(res); drain();
+        co_return unexpected(db_error(e));
     }
 
     Task<Result<std::unique_ptr<ITransaction>>>

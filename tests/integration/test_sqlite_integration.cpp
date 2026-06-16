@@ -25,6 +25,9 @@ int main() {
         co_await qbuem_db_it::with_transaction_suite(
             *driver, "sqlite://:memory:",
             "CREATE TABLE wtx(id BIGINT PRIMARY KEY, n BIGINT)");
+        co_await qbuem_db_it::streaming_suite(
+            *driver, "sqlite://:memory:",
+            "CREATE TABLE strm(id BIGINT PRIMARY KEY, n BIGINT)");
         co_await qbuem_db_it::drain_safety_suite(*driver, "sqlite://:memory:");
     });
 }
