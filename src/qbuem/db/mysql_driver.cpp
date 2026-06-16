@@ -11,6 +11,8 @@
 #include <charconv>
 #include <chrono>
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -22,6 +24,10 @@ using namespace qbuem::db;
 
 namespace qbuem_routine {
 namespace {
+
+// `my_bool` was removed in MySQL 8.0 (MYSQL_BIND::is_null is now `bool*`); derive
+// the element type from the field itself so this builds on old and new client.
+using MyBool = std::remove_pointer_t<decltype(std::declval<MYSQL_BIND>().is_null)>;
 
 // ─── DSN 파서 ────────────────────────────────────────────────────────────────
 
@@ -216,11 +222,21 @@ static MYSQL* create_connection(const MysqlDsn& dsn) {
     if (!conn) return nullptr;
 
     mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
-    const bool reconnect_opt = true;
-    mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect_opt);
+    // NOTE: MYSQL_OPT_RECONNECT is intentionally NOT enabled.  libmysqlclient's
+    // auto-reconnect silently drops session state (open transaction, temp tables,
+    // prepared statements, SET vars) mid-flight, which can corrupt transactional
+    // guarantees; the pool reconnects explicitly via ping().  It is also removed
+    // in MySQL 8.3+.
     if (dsn.use_ssl) {
+        // MYSQL_OPT_SSL_MODE is the modern replacement for the removed
+        // MYSQL_OPT_SSL_ENFORCE (it takes an unsigned-int enum, not a bool).
+#ifdef MYSQL_OPT_SSL_MODE
+        unsigned int ssl_mode = SSL_MODE_REQUIRED;
+        mysql_options(conn, MYSQL_OPT_SSL_MODE, &ssl_mode);
+#elif defined(MYSQL_OPT_SSL_ENFORCE)
         const bool ssl_enforce = true;
         mysql_options(conn, MYSQL_OPT_SSL_ENFORCE, &ssl_enforce);
+#endif
     }
 
     // TCP keepalive — 클라우드 방화벽 idle 연결 drop 대응
@@ -333,7 +349,7 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
     std::vector<MYSQL_BIND>        res_binds(ncols);
     std::vector<std::vector<char>> col_bufs(ncols);
     std::vector<unsigned long>     col_lens(ncols, 0);
-    std::vector<my_bool>           col_nulls(ncols, 0);
+    auto col_nulls = std::make_unique<MyBool[]>(ncols); // bool[]/my_bool[], all false
 
     for (unsigned int i = 0; i < ncols; ++i) {
         auto& b = res_binds[i];
