@@ -88,10 +88,15 @@ using qbuem_routine::db_detail::convert_placeholders;
 // Map MySQL's native error number to a transient (retryable) DbError where it
 // applies, else `fallback`. Lets with_transaction() retry real deadlocks /
 // lock-wait timeouts. 1213 = ER_LOCK_DEADLOCK, 1205 = ER_LOCK_WAIT_TIMEOUT.
+// 1213 = ER_LOCK_DEADLOCK, 1205 = ER_LOCK_WAIT_TIMEOUT, 3024 = ER_QUERY_TIMEOUT
+// (max_execution_time), 2013/2006 = CR_SERVER_LOST/GONE (a query that overran the
+// MYSQL_OPT_READ_TIMEOUT deadline aborts the connection with these).
 static DbError mysql_transient_or(MYSQL* db, DbError fallback) {
     switch (mysql_errno(db)) {
         case 1213: return DbError::Deadlock;
         case 1205: return DbError::LockTimeout;
+        case 3024: return DbError::StatementTimeout;
+        case 2013: case 2006: return DbError::StatementTimeout;
         default:   return fallback;
     }
 }
@@ -99,6 +104,8 @@ static DbError mysql_stmt_transient_or(MYSQL_STMT* stmt, DbError fallback) {
     switch (mysql_stmt_errno(stmt)) {
         case 1213: return DbError::Deadlock;
         case 1205: return DbError::LockTimeout;
+        case 3024: return DbError::StatementTimeout;
+        case 2013: case 2006: return DbError::StatementTimeout;
         default:   return fallback;
     }
 }
@@ -235,11 +242,21 @@ private:
 
 // ─── Connection-creation helper ───────────────────────────────────────────────
 
-static MYSQL* create_connection(const MysqlDsn& dsn) {
+static MYSQL* create_connection(const MysqlDsn& dsn, unsigned query_timeout_ms = 0) {
     MYSQL* conn = mysql_init(nullptr);
     if (!conn) return nullptr;
 
     mysql_options(conn, MYSQL_SET_CHARSET_NAME, "utf8mb4");
+    // Hard query-timeout backstop. max_execution_time (set after connect) does NOT
+    // apply to the prepared-statement (binary) protocol this driver uses, so rely
+    // on a network read timeout: if the server hasn't produced the result within
+    // the deadline the client aborts (errno CR_SERVER_LOST 2013 → StatementTimeout).
+    // Granularity is whole seconds, so sub-second timeouts round up to 1s.
+    if (query_timeout_ms > 0) {
+        unsigned read_timeout_sec = (query_timeout_ms + 999) / 1000;
+        if (read_timeout_sec < 1) read_timeout_sec = 1;
+        mysql_options(conn, MYSQL_OPT_READ_TIMEOUT, &read_timeout_sec);
+    }
     // NOTE: MYSQL_OPT_RECONNECT is intentionally NOT enabled.  libmysqlclient's
     // auto-reconnect silently drops session state (open transaction, temp tables,
     // prepared statements, SET vars) mid-flight, which can corrupt transactional
@@ -285,6 +302,15 @@ static MYSQL* create_connection(const MysqlDsn& dsn) {
                             nullptr, 0)) {
         mysql_close(conn);
         return nullptr;
+    }
+    // Enforce the query timeout server-side: max_execution_time cancels a runaway
+    // SELECT (→ errno 3024, mapped to StatementTimeout). It applies to read-only
+    // SELECTs only — MySQL has no per-statement timeout for writes — but covers the
+    // common runaway-query case. MySQL 5.7.8+; ignored (harmless) on MariaDB.
+    if (query_timeout_ms > 0) {
+        const std::string sql =
+            "SET SESSION max_execution_time=" + std::to_string(query_timeout_ms);
+        mysql_query(conn, sql.c_str());
     }
     return conn;
 }
@@ -683,11 +709,12 @@ class MysqlConnectionPool final : public IConnectionPool {
 public:
     MysqlConnectionPool(MysqlDsn dsn, PoolConfig config)
         : dsn_(std::move(dsn))
-        , max_size_(config.max_size > 0 ? config.max_size : 16) {
+        , max_size_(config.max_size > 0 ? config.max_size : 16)
+        , query_timeout_ms_(config.query_timeout_ms) {
         const size_t min_sz = config.min_size > 0 ? config.min_size : 2;
         std::lock_guard lock{mutex_};
         for (size_t i = 0; i < min_sz; ++i) {
-            MYSQL* c = create_connection(dsn_);
+            MYSQL* c = create_connection(dsn_, query_timeout_ms_);
             if (!c) break;
             idle_.push(slots_.size());
             slots_.push_back(std::make_shared<MysqlSlot>(c));
@@ -709,7 +736,7 @@ public:
             std::shared_ptr<MysqlSlot> slot = slots_[idx];
             // Only ping connections idle for more than 30s (avoid pinging every acquire)
             if (slot->needs_liveness_check() && mysql_ping(slot->conn) != 0) {
-                MYSQL* fresh = create_connection(dsn_);
+                MYSQL* fresh = create_connection(dsn_, query_timeout_ms_);
                 if (!fresh) {
                     lock.lock(); idle_.push(idx);
                     co_return unexpected(db_error(DbError::ConnectionFailed));
@@ -727,7 +754,7 @@ public:
             slots_.push_back(nullptr); // reserve the index
             lock.unlock();
 
-            MYSQL* c = create_connection(dsn_);
+            MYSQL* c = create_connection(dsn_, query_timeout_ms_);
             if (!c) {
                 lock.lock(); slots_.pop_back();
                 co_return unexpected(db_error(DbError::ConnectionFailed));
@@ -779,6 +806,7 @@ public:
 private:
     MysqlDsn                                  dsn_;
     size_t                                    max_size_;
+    unsigned                                  query_timeout_ms_{0};
     mutable std::mutex                        mutex_;
     // shared_ptr so a connection checked out of the pool keeps its MysqlSlot
     // (MYSQL* + mutex) alive even if drain() clears the pool concurrently —

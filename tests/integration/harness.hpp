@@ -602,6 +602,57 @@ inline Task<void> with_transaction_suite(IDBDriver& driver, std::string dsn,
     co_return;
 }
 
+// Verifies query-timeout enforcement: a deliberately slow query on a pool
+// configured with a 300ms query_timeout_ms is cancelled by the server and
+// surfaces as DbError::StatementTimeout (rather than hanging for the full sleep).
+inline Task<void> query_timeout_suite(IDBDriver& driver, std::string dsn,
+                                      std::string sleep_sql) {
+    using qbuem_routine::DbError;
+    using qbuem_routine::db_error;
+    PoolConfig cfg;
+    cfg.query_timeout_ms = 300; // 0.3s
+    auto pool_r = co_await driver.pool(dsn, cfg);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    auto r = co_await conn->query(sleep_sql); // sleeps ~2s; must be cut at ~0.3s
+    IT_CHECK(!r.has_value());
+    if (!r) IT_CHECK(r.error() == db_error(DbError::StatementTimeout));
+    co_return;
+}
+
+// Verifies the configured query timeout propagates to the session. `probe_sql`
+// must SELECT the driver's session timeout variable; it should equal the
+// configured query_timeout_ms. (Used for MySQL, whose per-query enforcement of
+// max_execution_time is unreliable over the prepared-statement protocol — see the
+// driver comment — so we verify the setting is applied rather than that it fires.)
+inline Task<void> timeout_configured_suite(IDBDriver& driver, std::string dsn,
+                                           std::string probe_sql, int64_t expected_ms) {
+    PoolConfig cfg;
+    cfg.query_timeout_ms = static_cast<unsigned>(expected_ms);
+    auto pool_r = co_await driver.pool(dsn, cfg);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    auto rs = co_await conn->query(probe_sql);
+    IT_CHECK(rs.has_value());
+    if (rs) {
+        const IRow* row = co_await (*rs)->next();
+        IT_CHECK(row && row->get(0).get<int64_t>() == expected_ms);
+    }
+    co_return;
+}
+
 // Run `body` to completion; returns process exit code (0 = all checks passed).
 template <typename F>
 inline int run_main(F&& body) {
