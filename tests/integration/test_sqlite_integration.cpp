@@ -14,6 +14,11 @@ int main() {
             "CREATE TABLE orm_user(id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "name TEXT, age BIGINT)");
         co_await qbuem_db_it::txn_isolation_suite(*driver, "sqlite://:memory:");
+        // Poolable shared-cache memory DB (multiple connections share one DB) —
+        // proves the SQLite pool hands out independent connections, unlike a
+        // private ":memory:" database.
+        co_await qbuem_db_it::multi_connection_suite(
+            *driver, "sqlite://file:qbuem_it_multiconn?mode=memory&cache=shared");
         co_await qbuem_db_it::drain_safety_suite(*driver, "sqlite://:memory:");
     });
 }

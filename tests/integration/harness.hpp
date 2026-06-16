@@ -259,6 +259,41 @@ inline Task<void> txn_isolation_suite(IDBDriver& driver, std::string dsn) {
     co_return;
 }
 
+// Proves the pool hands out multiple INDEPENDENT physical connections: two
+// connections, acquired at once, can each hold their own open transaction
+// simultaneously.  That is impossible on a single shared connection — a second
+// BEGIN on the same handle errors ("cannot start a transaction within a
+// transaction" on SQLite; the others would share one session).  Also checks that
+// the configured max_size is honored.  For SQLite pass a poolable DSN (a file or
+// a shared-cache memory URI), not a private ":memory:" database.
+inline Task<void> multi_connection_suite(IDBDriver& driver, std::string dsn) {
+    PoolConfig cfg;
+    cfg.min_size = 2;
+    cfg.max_size = 4;
+    auto pool_r = co_await driver.pool(dsn, cfg);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    IT_CHECK(pool->max_size() == 4); // config honored (not hardcoded to 1)
+
+    auto c1 = co_await pool->acquire();
+    auto c2 = co_await pool->acquire();
+    IT_CHECK(c1.has_value());
+    IT_CHECK(c2.has_value()); // a second live connection (not the same one)
+    if (!c1 || !c2) co_return;
+    auto conn1 = std::move(*c1);
+    auto conn2 = std::move(*c2);
+
+    // Two independent transactions held at the same time ⇒ two distinct sessions.
+    auto t1 = co_await conn1->begin();
+    IT_CHECK(t1.has_value());
+    auto t2 = co_await conn2->begin();
+    IT_CHECK(t2.has_value()); // would fail if conn2 were the same connection as conn1
+    if (t1) IT_CHECK((co_await (*t1)->rollback()).has_value());
+    if (t2) IT_CHECK((co_await (*t2)->rollback()).has_value());
+    co_return;
+}
+
 // ── ORM end-to-end ────────────────────────────────────────────────────────────
 // Entity for the ORM suite. Registered once per test binary via register_table.
 struct OrmUser {

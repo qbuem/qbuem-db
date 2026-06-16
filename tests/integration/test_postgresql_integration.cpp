@@ -21,6 +21,8 @@ int main() {
             "CREATE TABLE orm_user(id BIGSERIAL PRIMARY KEY, name TEXT, age BIGINT)");
         co_await qbuem_db_it::txn_isolation_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
+        co_await qbuem_db_it::multi_connection_suite(
+            *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
         co_await qbuem_db_it::drain_safety_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
     });
