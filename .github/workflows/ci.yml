@@ -50,3 +50,49 @@ jobs:
             ./$t
             echo "::endgroup::"
           done
+
+  # Integration tests: drive the real SQLite / PostgreSQL / MySQL drivers
+  # end-to-end against live servers (service containers).  Linux uses the epoll
+  # reactor (QBUEM_HAS_IOURING undefined).
+  integration:
+    name: Integration (live DB servers)
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h127.0.0.1 -uroot -ptest"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      PG_DSN: "postgresql://postgres:test@127.0.0.1:5432/testdb"
+      MYSQL_DSN: "mysql://root:test@127.0.0.1:3306/test"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install dev libraries
+        run: sudo apt-get update -q && sudo apt-get install -y g++-13 libpq-dev libmysqlclient-dev libsqlite3-dev
+      - name: Checkout qbuem-stack
+        uses: actions/checkout@v6
+        with: { repository: qbuem/qbuem-stack, path: _stack }
+      - name: Build & run integration tests
+        run: |
+          set -e
+          INC="-Isrc -I_stack/include -Itests/integration"
+          # Linux reactor sources (epoll fallback — QBUEM_HAS_IOURING not defined).
+          RX="_stack/src/core/reactor.cpp _stack/src/core/dispatcher.cpp _stack/src/core/epoll_reactor.cpp"
+          IT=tests/integration
+          echo "::group::sqlite";     g++-13 -std=c++23 $INC $IT/test_sqlite_integration.cpp     src/qbuem/db/sqlite3_driver.cpp    $RX -lsqlite3      -o it_sqlite && ./it_sqlite;         echo "::endgroup::"
+          echo "::group::postgresql"; g++-13 -std=c++23 $INC $IT/test_postgresql_integration.cpp src/qbuem/db/postgresql_driver.cpp $RX -lpq           -o it_pg     && ./it_pg;             echo "::endgroup::"
+          echo "::group::mysql";      g++-13 -std=c++23 $INC $IT/test_mysql_integration.cpp      src/qbuem/db/mysql_driver.cpp      $RX -lmysqlclient -o it_mysql && ./it_mysql;          echo "::endgroup::"
