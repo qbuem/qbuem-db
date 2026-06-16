@@ -159,6 +159,46 @@ static qbuem::Task<void> redis_crud_suite(redis::RedisClient& c) {
     co_return;
 }
 
+// Exercises Redis transactions (MULTI/EXEC/DISCARD/WATCH).
+static qbuem::Task<void> redis_txn_suite(redis::RedisClient& c) {
+    co_await c.flushdb();
+
+    // transaction() helper: SET + INCR run atomically; EXEC returns both results.
+    {
+        auto r = co_await c.transaction({
+            {"SET", "tx", "10"},
+            {"INCR", "tx"},
+        });
+        IT_CHECK(r.has_value());
+        if (r) {
+            IT_CHECK(r->type == redis::RedisValue::Type::Array);
+            IT_CHECK(r->array.size() == 2);
+            if (r->array.size() == 2) {
+                IT_CHECK(r->array[0].is_ok());        // SET → OK
+                IT_CHECK(r->array[1].as_int() == 11); // INCR → 11
+            }
+        }
+        auto g = co_await c.get("tx");
+        IT_CHECK(g.has_value() && g->as_string() == "11");
+    }
+
+    // DISCARD: queued writes must not be applied.
+    {
+        IT_CHECK((co_await c.multi()).has_value());
+        IT_CHECK((co_await c.command({"SET", "tx", "999"})).has_value()); // QUEUED
+        IT_CHECK((co_await c.discard()).has_value());
+        auto g = co_await c.get("tx");
+        IT_CHECK(g.has_value() && g->as_string() == "11"); // unchanged by discard
+    }
+
+    // WATCH / UNWATCH primitives (optimistic locking) are available.
+    {
+        IT_CHECK((co_await c.watch({"tx"})).has_value());
+        IT_CHECK((co_await c.unwatch()).has_value());
+    }
+    co_return;
+}
+
 int main() {
     const char* dsn = std::getenv("REDIS_DSN");
     std::string url = dsn ? dsn : "redis://127.0.0.1:6380";
@@ -168,5 +208,6 @@ int main() {
         if (!cli_r) co_return;
         auto cli = std::move(*cli_r);
         co_await redis_crud_suite(*cli);
+        co_await redis_txn_suite(*cli);
     });
 }

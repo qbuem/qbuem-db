@@ -721,6 +721,66 @@ Task<Result<RedisValue>> RedisClient::command(std::vector<std::string> args) {
     co_return *r;
 }
 
+// ── Transactions (MULTI / EXEC) ───────────────────────────────────────────────
+
+Task<Result<RedisValue>> RedisClient::multi() {
+    auto r = RC_SEND("MULTI");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::exec() {
+    auto r = RC_SEND("EXEC");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::discard() {
+    auto r = RC_SEND("DISCARD");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::watch(std::vector<std::string> keys) {
+    std::vector<std::string> args;
+    args.reserve(keys.size() + 1);
+    args.emplace_back("WATCH");
+    for (auto& k : keys) args.push_back(std::move(k));
+    auto r = co_await impl_->send(std::move(args));
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::unwatch() {
+    auto r = RC_SEND("UNWATCH");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>>
+RedisClient::transaction(std::vector<std::vector<std::string>> commands) {
+    auto begin = co_await impl_->send({"MULTI"});
+    RC_CHECK(begin);
+    if (!begin->is_ok())
+        co_return unexpected(db_error(DbError::TransactionFailed));
+
+    // Queue each command (the server replies "QUEUED" for each).
+    for (auto& cmd : commands) {
+        auto q = co_await impl_->send(cmd);
+        if (!q) {
+            // A command rejected at queue time (e.g. bad arity) aborts the block;
+            // DISCARD to leave the connection in a clean state, then surface it.
+            co_await impl_->send({"DISCARD"});
+            co_return unexpected(q.error());
+        }
+    }
+
+    // EXEC runs the queued commands atomically and returns an Array of results.
+    auto result = co_await impl_->send({"EXEC"});
+    RC_CHECK(result);
+    co_return *result;
+}
+
 #undef RC_SEND
 #undef RC_CHECK
 

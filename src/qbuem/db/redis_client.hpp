@@ -220,6 +220,32 @@ public:
     [[nodiscard]] qbuem::Task<Result<std::optional<int64_t>>>
     zrank(std::string_view key, std::string_view member);
 
+    // ── Transactions (MULTI / EXEC) ──────────────────────────────────────────
+
+    /// MULTI — begin a transaction block. Subsequent commands are queued by the
+    /// server (each replies "QUEUED") until exec() or discard().
+    [[nodiscard]] qbuem::Task<Result<RedisValue>> multi();
+
+    /// EXEC — atomically run the queued commands. The reply is an Array with one
+    /// element per queued command (in order), each its own result or error.
+    [[nodiscard]] qbuem::Task<Result<RedisValue>> exec();
+
+    /// DISCARD — abandon a transaction block; queued commands are not run.
+    [[nodiscard]] qbuem::Task<Result<RedisValue>> discard();
+
+    /// WATCH key [key ...] — mark keys for optimistic locking. A following EXEC
+    /// fails (nil reply) if any watched key changed since the WATCH.
+    [[nodiscard]] qbuem::Task<Result<RedisValue>> watch(std::vector<std::string> keys);
+
+    /// UNWATCH — forget all watched keys.
+    [[nodiscard]] qbuem::Task<Result<RedisValue>> unwatch();
+
+    /// Convenience: run `commands` atomically (MULTI → queue each → EXEC).
+    /// Returns the EXEC reply (an Array of per-command results). If queueing a
+    /// command fails, the transaction is DISCARDed and the error is returned.
+    [[nodiscard]] qbuem::Task<Result<RedisValue>>
+    transaction(std::vector<std::vector<std::string>> commands);
+
     // ── 기타 ─────────────────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<std::string>> type(std::string_view key);
