@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+# Network-independent unit tests for the security-critical pure logic:
+#   - RESP2 parser (untrusted-server input hardening)
+#   - ORM SQL generator (identifier-injection defense)
+# Both need only qbuem-stack headers (no DB servers / libpq / libmysqlclient), so
+# they compile directly against a checked-out qbuem-stack — fast, and run under
+# GCC 13 (C++23 <expected>) both normally and under ASan+UBSan.
+jobs:
+  unit:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "GCC 13",             flags: "-O2" }
+          - { label: "GCC 13 · ASan+UBSan", flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -g" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install deps
+        run: sudo apt-get update -q && sudo apt-get install -y liburing-dev
+
+      - name: Checkout qbuem-stack (headers)
+        uses: actions/checkout@v6
+        with:
+          repository: qbuem/qbuem-stack
+          path: _stack
+
+      - name: Build & run tests
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:abort_on_error=1
+        run: |
+          set -e
+          INC="-Isrc -I_stack/include"
+          for t in test_resp_parser test_orm; do
+            echo "::group::$t"
+            g++ -std=c++23 ${{ matrix.flags }} $INC tests/$t.cpp -o $t
+            ./$t
+            echo "::endgroup::"
+          done

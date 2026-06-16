@@ -129,7 +129,11 @@ enum class SortOrder { Asc, Desc };
 template<typename T>
 class TableMeta {
 public:
-    explicit TableMeta(std::string table) : table_(std::move(table)) {}
+    explicit TableMeta(std::string table) : table_(std::move(table)) {
+        // Table name is interpolated into every generated statement; reject an
+        // unsafe identifier at registration rather than at query time.
+        (void)ident(table_);
+    }
 
     // ── 빌더 API ─────────────────────────────────────────────────────────────
 
@@ -221,7 +225,7 @@ public:
 
     /// SELECT ... FROM table WHERE col = $p
     [[nodiscard]] std::string sql_select_where(std::string_view col, int p = 1) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) + " = " + ph_sv(p);
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) + " = " + ph_sv(p);
     }
 
     /// SELECT ... FROM table WHERE col = $p ORDER BY order_col [ASC|DESC]
@@ -229,13 +233,13 @@ public:
                                                   std::string_view order_col,
                                                   int p = 1,
                                                   SortOrder order = SortOrder::Asc) const {
-        return sql_select_where(col, p) + " ORDER BY " + std::string(order_col) + std::string{sort_dir(order)};
+        return sql_select_where(col, p) + " ORDER BY " + std::string(ident(order_col)) + std::string{sort_dir(order)};
     }
 
     /// SELECT ... FROM table ORDER BY order_col [ASC|DESC]
     [[nodiscard]] std::string sql_select_all_ordered(std::string_view order_col,
                                                       SortOrder order = SortOrder::Asc) const {
-        return cache_.sql_select_all + " ORDER BY " + std::string(order_col) + std::string{sort_dir(order)};
+        return cache_.sql_select_all + " ORDER BY " + std::string(ident(order_col)) + std::string{sort_dir(order)};
     }
 
     /// SELECT ... FROM table WHERE raw_where
@@ -247,30 +251,30 @@ public:
     [[nodiscard]] std::string sql_select_where_in(std::string_view col,
                                                    std::size_t n,
                                                    int start_p = 1) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) +
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) +
                " IN (" + in_placeholders(n, start_p) + ")";
     }
 
     /// SELECT ... FROM table WHERE col IS NULL
     [[nodiscard]] std::string sql_select_where_null(std::string_view col) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) + " IS NULL";
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) + " IS NULL";
     }
 
     /// SELECT ... FROM table WHERE col IS NOT NULL
     [[nodiscard]] std::string sql_select_where_not_null(std::string_view col) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) + " IS NOT NULL";
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) + " IS NOT NULL";
     }
 
     /// SELECT ... FROM table WHERE col BETWEEN $1 AND $2
     [[nodiscard]] std::string sql_select_where_between(std::string_view col,
                                                         int p1 = 1, int p2 = 2) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) +
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) +
                " BETWEEN " + ph_sv(p1) + " AND " + ph_sv(p2);
     }
 
     /// SELECT ... FROM table WHERE col LIKE $1
     [[nodiscard]] std::string sql_select_where_like(std::string_view col, int p = 1) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col) + " LIKE " + ph_sv(p);
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col)) + " LIKE " + ph_sv(p);
     }
 
     // ── SQL 생성 — 페이지네이션 ───────────────────────────────────────────────
@@ -307,7 +311,7 @@ public:
 
     /// SELECT COUNT(*) FROM table WHERE col = $p
     [[nodiscard]] std::string sql_count_where(std::string_view col, int p = 1) const {
-        return "SELECT COUNT(*) FROM " + table_ + " WHERE " + std::string(col) + " = " + ph_sv(p);
+        return "SELECT COUNT(*) FROM " + table_ + " WHERE " + std::string(ident(col)) + " = " + ph_sv(p);
     }
 
     /// SELECT COUNT(*) FROM table WHERE raw_where
@@ -319,7 +323,7 @@ public:
     [[nodiscard]] std::string sql_count_where_in(std::string_view col,
                                                   std::size_t n,
                                                   int start_p = 1) const {
-        return "SELECT COUNT(*) FROM " + table_ + " WHERE " + std::string(col) +
+        return "SELECT COUNT(*) FROM " + table_ + " WHERE " + std::string(ident(col)) +
                " IN (" + in_placeholders(n, start_p) + ")";
     }
 
@@ -333,7 +337,7 @@ public:
         int p = start_p;
         for (auto c : cols) {
             if (!where.empty()) where += " AND ";
-            where += c;
+            where += ident(c);
             where += " = ";
             where += ph_sv(p++);
         }
@@ -344,8 +348,8 @@ public:
     [[nodiscard]] std::string sql_select_where2(std::string_view col1,
                                                  std::string_view col2,
                                                  int p1 = 1, int p2 = 2) const {
-        return cache_.sql_select_all + " WHERE " + std::string(col1) + " = " + ph_sv(p1) +
-               " AND " + std::string(col2) + " = " + ph_sv(p2);
+        return cache_.sql_select_all + " WHERE " + std::string(ident(col1)) + " = " + ph_sv(p1) +
+               " AND " + std::string(ident(col2)) + " = " + ph_sv(p2);
     }
 
     /// SELECT ... WHERE col1=$1 AND col2=$2 AND col3=$3
@@ -354,9 +358,9 @@ public:
                                                  std::string_view col3,
                                                  int p1=1, int p2=2, int p3=3) const {
         return cache_.sql_select_all + " WHERE " +
-               std::string(col1) + " = " + ph_sv(p1) + " AND " +
-               std::string(col2) + " = " + ph_sv(p2) + " AND " +
-               std::string(col3) + " = " + ph_sv(p3);
+               std::string(ident(col1)) + " = " + ph_sv(p1) + " AND " +
+               std::string(ident(col2)) + " = " + ph_sv(p2) + " AND " +
+               std::string(ident(col3)) + " = " + ph_sv(p3);
     }
 
     // ── SQL 생성 — INSERT / UPSERT ────────────────────────────────────────────
@@ -435,7 +439,7 @@ public:
     /// UPDATE table SET col=$1 WHERE pk=$2 [RETURNING *]
     [[nodiscard]] std::string sql_update_col_pk(std::string_view col,
                                                  bool returning = true) const {
-        auto sql = "UPDATE " + table_ + " SET " + std::string(col) +
+        auto sql = "UPDATE " + table_ + " SET " + std::string(ident(col)) +
                    " = " + ph_sv(1) + " WHERE " + pk_ + " = " + ph_sv(2);
         if (returning && supports_returning()) sql += " RETURNING *";
         return sql;
@@ -450,14 +454,14 @@ public:
 
     /// DELETE FROM table WHERE col=$1
     [[nodiscard]] std::string sql_delete_where(std::string_view col) const {
-        return "DELETE FROM " + table_ + " WHERE " + std::string(col) + " = " + ph_sv(1);
+        return "DELETE FROM " + table_ + " WHERE " + std::string(ident(col)) + " = " + ph_sv(1);
     }
 
     /// DELETE FROM table WHERE col1=$1 AND col2=$2
     [[nodiscard]] std::string sql_delete_where2(std::string_view col1,
                                                   std::string_view col2) const {
-        return "DELETE FROM " + table_ + " WHERE " + std::string(col1) + " = " + ph_sv(1) +
-               " AND " + std::string(col2) + " = " + ph_sv(2);
+        return "DELETE FROM " + table_ + " WHERE " + std::string(ident(col1)) + " = " + ph_sv(1) +
+               " AND " + std::string(ident(col2)) + " = " + ph_sv(2);
     }
 
     // ── 파라미터 바인딩 ───────────────────────────────────────────────────────
@@ -627,6 +631,52 @@ private:
 
     [[nodiscard]] static std::string_view sort_dir(SortOrder order) noexcept {
         return (order == SortOrder::Desc) ? " DESC" : " ASC";
+    }
+
+    // ── Identifier safety ─────────────────────────────────────────────────────
+    // Column / table / order-by names are interpolated into SQL (identifiers
+    // cannot be bound as parameters).  Validate them against a strict SQL
+    // identifier grammar so an application that forwards a user-controlled column
+    // or sort field (a classic ORDER BY / column-injection vector) cannot break
+    // out of the identifier.  Allowed: `name`, `schema.name`, optionally double-
+    // quoted, each segment `[A-Za-z_][A-Za-z0-9_]*`.  Anything with whitespace,
+    // quotes-mid-token, parentheses, semicolons, etc. is rejected.  The
+    // `*_raw_where()` methods are the explicit, documented escape hatch and are
+    // NOT validated — never pass untrusted input to them.
+    [[nodiscard]] static bool is_safe_ident(std::string_view s) noexcept {
+        auto seg_ok = [](std::string_view seg) noexcept {
+            if (seg.size() >= 2 && seg.front() == '"' && seg.back() == '"')
+                seg = seg.substr(1, seg.size() - 2);
+            if (seg.empty() || seg.size() > 128) return false;
+            const auto is_start = [](char c) {
+                return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+            };
+            const auto is_rest = [&](char c) {
+                return is_start(c) || (c >= '0' && c <= '9');
+            };
+            if (!is_start(seg.front())) return false;
+            for (char c : seg.substr(1))
+                if (!is_rest(c)) return false;
+            return true;
+        };
+        if (s.empty()) return false;
+        size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+            if (i == s.size() || s[i] == '.') {
+                if (!seg_ok(s.substr(start, i - start))) return false;
+                start = i + 1;
+            }
+        }
+        return true;
+    }
+
+    /// Validate an interpolated identifier; throws std::invalid_argument if it is
+    /// not a safe SQL identifier.  Returns the identifier for inline use.
+    [[nodiscard]] static std::string_view ident(std::string_view s) {
+        if (!is_safe_ident(s))
+            throw std::invalid_argument(
+                std::format("orm: unsafe SQL identifier '{}'", s));
+        return s;
     }
 
     // ── IN 플레이스홀더 빌더 (최적화) ────────────────────────────────────────
