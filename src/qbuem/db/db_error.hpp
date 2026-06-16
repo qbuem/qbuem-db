@@ -5,21 +5,21 @@
 
 namespace qbuem_routine {
 
-// ─── 공통 DB 에러 코드 ────────────────────────────────────────────────────────
+// ─── Common DB error codes ────────────────────────────────────────────────────
 //
-// IDBDriver / IConnectionPool / IConnection / ITransaction / IStatement 인터페이스를
-// 구현하는 모든 드라이버(PostgreSQL, MySQL, SQLite3)는 이 에러 코드를 반환한다.
-// 호출자는 드라이버 종류에 무관하게 동일한 방식으로 에러를 처리할 수 있다.
+// Every driver implementing the IDBDriver / IConnectionPool / IConnection /
+// ITransaction / IStatement interfaces (PostgreSQL, MySQL, SQLite3) returns these
+// error codes. Callers can handle errors the same way regardless of driver type.
 
 enum class DbError : int {
-    // ── 풀 / 연결 수준 ──────────────────────────────────────────────────────
-    ConnectionFailed       = 1,  // pool() / acquire(): DB 서버 연결 불가
-    PoolExhausted          = 2,  // acquire(): 가용 연결 없음 (동기 드라이버)
-    // ── 쿼리 수준 ──────────────────────────────────────────────────────────
-    PrepareStatementFailed = 3,  // prepare(): prepared statement 생성 실패
-    QueryFailed            = 4,  // query() / execute() / execute_dml(): SQL 실행 실패
-    // ── 트랜잭션 수준 ──────────────────────────────────────────────────────
-    TransactionFailed      = 5,  // begin() / commit() / rollback() / savepoint() 실패
+    // ── Pool / connection level ─────────────────────────────────────────────
+    ConnectionFailed       = 1,  // pool() / acquire(): cannot connect to the DB server
+    PoolExhausted          = 2,  // acquire(): no available connection (synchronous driver)
+    // ── Query level ─────────────────────────────────────────────────────────
+    PrepareStatementFailed = 3,  // prepare(): failed to create the prepared statement
+    QueryFailed            = 4,  // query() / execute() / execute_dml(): SQL execution failed
+    // ── Transaction level ───────────────────────────────────────────────────
+    TransactionFailed      = 5,  // begin() / commit() / rollback() / savepoint() failed
 };
 
 struct DbErrorCategory final : std::error_category {

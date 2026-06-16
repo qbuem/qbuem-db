@@ -113,17 +113,19 @@ struct RedisReadAwaiter {
             [this, h, reactor](int) mutable {
                 char tmp[4096];
                 const ssize_t n = ::read(fd, tmp, sizeof(tmp));
-                if (n <= 0) {
+                if (n > 0) {
+                    parser->feed(tmp, static_cast<size_t>(n));
+                    if (!parser->has_complete()) return; // wait for the rest
+                } else {
                     error = true;
-                    reactor->unregister_event(fd, EventType::Read);
-                    reactor->post([h]() mutable { h.resume(); });
-                    return;
                 }
-                parser->feed(tmp, static_cast<size_t>(n));
-                if (parser->has_complete()) {
-                    reactor->unregister_event(fd, EventType::Read);
-                    reactor->post([h]() mutable { h.resume(); });
-                }
+                // unregister_event destroys THIS lambda (the reactor owns it), so
+                // copy everything still needed to stack locals first and touch no
+                // captured state afterwards — otherwise it is a use-after-free.
+                auto* r      = reactor;
+                auto  handle = h;
+                r->unregister_event(fd, EventType::Read);
+                r->post([handle]() mutable { handle.resume(); });
             });
     }
 
@@ -162,8 +164,12 @@ struct RedisWriteAwaiter {
                     error = true; break;
                 }
                 if (sent >= data.size() || error) {
-                    reactor->unregister_event(fd, EventType::Write);
-                    reactor->post([h]() mutable { h.resume(); });
+                    // See RedisReadAwaiter: unregister_event frees this lambda, so
+                    // copy what we need to locals before calling it.
+                    auto* r      = reactor;
+                    auto  handle = h;
+                    r->unregister_event(fd, EventType::Write);
+                    r->post([handle]() mutable { handle.resume(); });
                 }
             });
     }
@@ -210,19 +216,17 @@ static int connect_tcp(const RedisDsn& dsn) {
 
 struct RedisConnectAwaiter {
     int fd;
-    bool ready{false};
     bool error{false};
 
-    bool await_ready() noexcept {
-        // connect completes immediately for loopback connections
-        int err = 0;
-        socklen_t len = sizeof(err);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
-            ready = true;
-            return true;
-        }
-        return false;
-    }
+    // Always wait for the socket to become writable before proceeding.  A
+    // non-blocking connect() returns EINPROGRESS, and getsockopt(SO_ERROR) reads 0
+    // *while still connecting* — so a SO_ERROR fast-path would report "ready"
+    // before the handshake completes.  Writing to a still-connecting socket then
+    // fails (ENOTCONN on macOS/BSD), which surfaced as a spurious ConnectionFailed
+    // on the very first command.  The writable event fires once connect() resolves
+    // (immediately for an already-connected loopback socket), and await_suspend
+    // verifies SO_ERROR at that point.
+    bool await_ready() noexcept { return false; }
 
     void await_suspend(std::coroutine_handle<> h) noexcept {
         auto* reactor = Reactor::current();
@@ -232,8 +236,12 @@ struct RedisConnectAwaiter {
                 socklen_t len = sizeof(err);
                 ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
                 error = (err != 0);
-                reactor->unregister_event(fd, EventType::Write);
-                reactor->post([h]() mutable { h.resume(); });
+                // See RedisReadAwaiter: unregister_event frees this lambda, so
+                // copy what we need to locals before calling it.
+                auto* r      = reactor;
+                auto  handle = h;
+                r->unregister_event(fd, EventType::Write);
+                r->post([handle]() mutable { handle.resume(); });
             });
     }
 
@@ -713,7 +721,127 @@ Task<Result<RedisValue>> RedisClient::command(std::vector<std::string> args) {
     co_return *r;
 }
 
+// ── Transactions (MULTI / EXEC) ───────────────────────────────────────────────
+
+Task<Result<RedisValue>> RedisClient::multi() {
+    auto r = RC_SEND("MULTI");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::exec() {
+    auto r = RC_SEND("EXEC");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::discard() {
+    auto r = RC_SEND("DISCARD");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::watch(std::vector<std::string> keys) {
+    std::vector<std::string> args;
+    args.reserve(keys.size() + 1);
+    args.emplace_back("WATCH");
+    for (auto& k : keys) args.push_back(std::move(k));
+    auto r = co_await impl_->send(std::move(args));
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>> RedisClient::unwatch() {
+    auto r = RC_SEND("UNWATCH");
+    RC_CHECK(r);
+    co_return *r;
+}
+
+Task<Result<RedisValue>>
+RedisClient::transaction(std::vector<std::vector<std::string>> commands) {
+    auto begin = co_await impl_->send({"MULTI"});
+    RC_CHECK(begin);
+    if (!begin->is_ok())
+        co_return unexpected(db_error(DbError::TransactionFailed));
+
+    // Queue each command (the server replies "QUEUED" for each).
+    for (auto& cmd : commands) {
+        auto q = co_await impl_->send(cmd);
+        if (!q) {
+            // A command rejected at queue time (e.g. bad arity) aborts the block;
+            // DISCARD to leave the connection in a clean state, then surface it.
+            co_await impl_->send({"DISCARD"});
+            co_return unexpected(q.error());
+        }
+    }
+
+    // EXEC runs the queued commands atomically and returns an Array of results.
+    auto result = co_await impl_->send({"EXEC"});
+    RC_CHECK(result);
+    co_return *result;
+}
+
 #undef RC_SEND
 #undef RC_CHECK
+
+// ── RedisPool ─────────────────────────────────────────────────────────────────
+
+PooledRedisConnection::~PooledRedisConnection() {
+    if (client_ && pool_) pool_->release(std::move(client_));
+}
+
+Task<Result<std::unique_ptr<RedisPool>>>
+RedisPool::create(std::string_view dsn, std::size_t size) {
+    const std::size_t target = size > 0 ? size : 4;
+    auto pool = std::unique_ptr<RedisPool>(new RedisPool(std::string(dsn), target));
+    for (std::size_t i = 0; i < target; ++i) {
+        auto cr = co_await RedisClient::connect(dsn);
+        if (!cr) {
+            if (i == 0) co_return unexpected(cr.error()); // cannot connect at all
+            break;                                        // accept a partial pool
+        }
+        pool->idle_.push_back(std::move(*cr));
+        ++pool->total_;
+    }
+    co_return pool;
+}
+
+Task<Result<PooledRedisConnection>> RedisPool::acquire() {
+    {
+        std::lock_guard lock{mutex_};
+        if (!idle_.empty()) {
+            auto client = std::move(idle_.back());
+            idle_.pop_back();
+            co_return PooledRedisConnection{std::move(client), this};
+        }
+        if (total_ >= max_size_)
+            co_return unexpected(db_error(DbError::PoolExhausted));
+        ++total_; // reserve the slot before the (async) connect, released on failure
+    }
+
+    auto cr = co_await RedisClient::connect(dsn_);
+    if (!cr) {
+        std::lock_guard lock{mutex_};
+        --total_;
+        co_return unexpected(cr.error());
+    }
+    co_return PooledRedisConnection{std::move(*cr), this};
+}
+
+void RedisPool::release(std::unique_ptr<RedisClient> client) noexcept {
+    if (!client) return;
+    std::lock_guard lock{mutex_};
+    idle_.push_back(std::move(client));
+}
+
+std::size_t RedisPool::idle_count() const noexcept {
+    std::lock_guard lock{mutex_};
+    return idle_.size();
+}
+
+std::size_t RedisPool::size() const noexcept {
+    std::lock_guard lock{mutex_};
+    return total_;
+}
 
 } // namespace qbuem_routine::redis

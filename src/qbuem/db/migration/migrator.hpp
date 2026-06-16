@@ -2,19 +2,19 @@
 
 /**
  * @file db/migration/migrator.hpp
- * @brief 드라이버 독립적 DB 마이그레이션 프레임워크.
+ * @brief Driver-independent DB migration framework.
  *
- * ## 개념
- * - **Migration**: 버전 번호 + 설명 + up SQL (+ 선택적 down SQL)
- * - **MigrationRunner**: IConnection을 통해 마이그레이션을 적용·롤백
- * - 적용 이력은 `__schema_migrations` 테이블에 저장
- * - 버전 번호는 unsigned integer (보통 타임스탬프 또는 순번 사용)
+ * ## Concepts
+ * - **Migration**: version number + description + up SQL (+ optional down SQL)
+ * - **MigrationRunner**: applies and rolls back migrations through IConnection
+ * - Applied history is stored in the `__schema_migrations` table
+ * - Version numbers are unsigned integers (typically a timestamp or sequence number)
  *
- * ## 사용법
+ * ## Usage
  * ```cpp
  * #include "db/migration/migrator.hpp"
  *
- * // 마이그레이션 정의
+ * // Define migrations
  * using namespace qbuem_routine::migration;
  *
  * static const std::vector<Migration> kMigrations = {
@@ -38,13 +38,13 @@
  *     },
  * };
  *
- * // 마이그레이션 실행
+ * // Run migrations
  * auto conn_r = co_await pool->acquire();
  * MigrationRunner runner{kMigrations, conn_r->get()};
  * auto result = co_await runner.migrate();
  * if (!result) { handle_error(result.error()); }
  *
- * // 상태 확인
+ * // Check status
  * auto status = co_await runner.status();
  * for (auto& s : *status) {
  *     fmt::print("{:04d} {:30s} {}\n",
@@ -52,21 +52,22 @@
  *                s.applied ? "applied" : "pending");
  * }
  *
- * // 특정 버전으로 롤백
+ * // Roll back to a specific version
  * co_await runner.rollback_to(1);
  * ```
  *
- * ## 드라이버별 플레이스홀더 차이
- * - PostgreSQL: $1, $2, ...  (기본값)
+ * ## Placeholder differences by driver
+ * - PostgreSQL: $1, $2, ...  (default)
  * - MySQL:      ?, ?, ...    (PlaceholderStyle::Question)
  * - SQLite:     ?, ?, ...    (PlaceholderStyle::Question)
  *
- * MigrationRunner 생성 시 style 인자로 지정합니다.
+ * Specify it via the style argument when constructing a MigrationRunner.
  */
 
 #include <qbuem/core/task.hpp>
 #include <qbuem/db/driver.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <optional>
@@ -86,20 +87,20 @@ using qbuem::db::IConnection;
 using qbuem::db::Value;
 using qbuem::db::IsolationLevel;
 
-// ── 플레이스홀더 스타일 ──────────────────────────────────────────────────────
+// ── Placeholder style ───────────────────────────────────────────────────────
 
 enum class PlaceholderStyle {
     Dollar,    ///< PostgreSQL: $1, $2, ...
     Question,  ///< MySQL / SQLite: ?, ?, ...
 };
 
-// ── Migration 정의 ────────────────────────────────────────────────────────────
+// ── Migration definition ──────────────────────────────────────────────────────
 
 struct Migration {
-    uint64_t    version;         ///< 고유 버전 번호 (타임스탬프 또는 순번)
-    std::string description;     ///< 설명 (사람이 읽기 위한 문자열)
-    std::string up;              ///< 적용 SQL (세미콜론으로 구분된 여러 문장 지원)
-    std::string down;            ///< 롤백 SQL (생략 가능)
+    uint64_t    version;         ///< Unique version number (timestamp or sequence number)
+    std::string description;     ///< Description (human-readable string)
+    std::string up;              ///< Apply SQL (supports multiple semicolon-separated statements)
+    std::string down;            ///< Rollback SQL (optional)
 };
 
 // ── MigrationStatus ───────────────────────────────────────────────────────────
@@ -108,18 +109,18 @@ struct MigrationStatus {
     uint64_t    version;
     std::string description;
     bool        applied{false};
-    std::optional<std::string> applied_at; ///< ISO8601 timestamp (적용된 경우)
+    std::optional<std::string> applied_at; ///< ISO8601 timestamp (if applied)
 };
 
 // ── MigrationResult ───────────────────────────────────────────────────────────
 
 struct MigrationResult {
-    uint32_t applied{0};   ///< 이번 실행에서 적용된 마이그레이션 수
-    uint32_t skipped{0};   ///< 이미 적용되어 건너뛴 수
-    uint64_t latest{0};    ///< 최종 버전 번호 (0 = 없음)
+    uint32_t applied{0};   ///< Number of migrations applied in this run
+    uint32_t skipped{0};   ///< Number skipped because already applied
+    uint64_t latest{0};    ///< Latest version number (0 = none)
 };
 
-// ── 에러 카테고리 ─────────────────────────────────────────────────────────────
+// ── Error category ────────────────────────────────────────────────────────────
 
 struct MigrationErrorCategory : std::error_category {
     const char* name() const noexcept override { return "migration"; }
@@ -140,7 +141,7 @@ inline std::error_code migration_error(int code) {
     return {code, cat};
 }
 
-// ── SQL 분할 (세미콜론 구분) ──────────────────────────────────────────────────
+// ── SQL splitting (semicolon-separated) ───────────────────────────────────────
 
 inline std::vector<std::string_view> split_sql(std::string_view sql) {
     std::vector<std::string_view> stmts;
@@ -151,7 +152,7 @@ inline std::vector<std::string_view> split_sql(std::string_view sql) {
         if (c == '\'' && (i == 0 || sql[i - 1] != '\\')) in_str = !in_str;
         if (!in_str && c == ';') {
             auto stmt = sql.substr(start, i - start);
-            // 공백만 있는 구문은 건너뜀
+            // Skip statements that contain only whitespace
             if (stmt.find_first_not_of(" \t\r\n") != std::string_view::npos)
                 stmts.push_back(stmt);
             start = i + 1;
@@ -168,9 +169,9 @@ inline std::vector<std::string_view> split_sql(std::string_view sql) {
 class MigrationRunner {
 public:
     /**
-     * @param migrations  정렬된 마이그레이션 목록 (version 오름차순)
-     * @param conn        DB 커넥션 (호출자가 수명 관리)
-     * @param style       플레이스홀더 스타일 (기본: Dollar/$N)
+     * @param migrations  Sorted list of migrations (ascending by version)
+     * @param conn        DB connection (lifetime managed by the caller)
+     * @param style       Placeholder style (default: Dollar/$N)
      */
     MigrationRunner(std::span<const Migration> migrations,
                     IConnection&               conn,
@@ -178,20 +179,22 @@ public:
         : migrations_(migrations.begin(), migrations.end())
         , conn_(conn)
         , style_(style) {
-        // version 순 정렬 보장
+        // Ensure ordering by version
         std::ranges::sort(migrations_,
                           [](const Migration& a, const Migration& b){
                               return a.version < b.version;
                           });
     }
 
-    // ── 초기화 — __schema_migrations 테이블 생성 ─────────────────────────────
+    // ── Initialization — create the __schema_migrations table ────────────────
 
     Task<Result<void>> init() {
+        // NB: description is TEXT NOT NULL with no DEFAULT — MySQL forbids a
+        // DEFAULT on TEXT/BLOB columns, and apply_one always supplies it anyway.
         const std::string sql = std::format(R"sql(
             CREATE TABLE IF NOT EXISTS __schema_migrations (
                 version     BIGINT      NOT NULL PRIMARY KEY,
-                description TEXT        NOT NULL DEFAULT '',
+                description TEXT        NOT NULL,
                 applied_at  {}  NOT NULL DEFAULT {}
             )
         )sql",
@@ -204,7 +207,7 @@ public:
         co_return {};
     }
 
-    // ── 현재 최대 적용 버전 ──────────────────────────────────────────────────
+    // ── Current maximum applied version ──────────────────────────────────────
 
     Task<Result<uint64_t>> current_version() {
         const std::string sql =
@@ -216,24 +219,25 @@ public:
         co_return static_cast<uint64_t>(row->get(uint16_t{0}).get<int64_t>());
     }
 
-    // ── 적용 여부 확인 ───────────────────────────────────────────────────────
+    // ── Check whether applied ────────────────────────────────────────────────
 
     Task<Result<bool>> is_applied(uint64_t version) {
         const std::string sql = std::format(
             "SELECT 1 FROM __schema_migrations WHERE version = {}",
             ph(1));
-        auto r = co_await conn_.query(sql, {Value{static_cast<int64_t>(version)}});
+        const Value params[] = {Value{static_cast<int64_t>(version)}};
+        auto r = co_await conn_.query(sql, params);
         if (!r) co_return unexpected(r.error());
         co_return (co_await (*r)->next()) != nullptr;
     }
 
-    // ── 마이그레이션 상태 목록 ───────────────────────────────────────────────
+    // ── Migration status list ────────────────────────────────────────────────
 
     Task<Result<std::vector<MigrationStatus>>> status() {
         auto init_r = co_await init();
         if (!init_r) co_return unexpected(init_r.error());
 
-        // 적용된 버전 로드
+        // Load applied versions
         const std::string sql =
             "SELECT version, applied_at FROM __schema_migrations ORDER BY version";
         auto r = co_await conn_.query(sql, {});
@@ -263,7 +267,7 @@ public:
         co_return result;
     }
 
-    // ── 전체 마이그레이션 적용 (pending 모두) ────────────────────────────────
+    // ── Apply all migrations (all pending) ───────────────────────────────────
 
     Task<Result<MigrationResult>> migrate() {
         auto init_r = co_await init();
@@ -288,7 +292,7 @@ public:
         co_return result;
     }
 
-    // ── 특정 버전까지만 적용 ─────────────────────────────────────────────────
+    // ── Apply only up to a specific version ──────────────────────────────────
 
     Task<Result<MigrationResult>> migrate_to(uint64_t target_version) {
         auto init_r = co_await init();
@@ -314,12 +318,12 @@ public:
         co_return result;
     }
 
-    // ── 마지막 마이그레이션 롤백 ─────────────────────────────────────────────
+    // ── Roll back the last migration ─────────────────────────────────────────
 
     Task<Result<void>> rollback() {
         auto ver_r = co_await current_version();
         if (!ver_r) co_return unexpected(ver_r.error());
-        if (*ver_r == 0) co_return {}; // 적용된 마이그레이션 없음
+        if (*ver_r == 0) co_return {}; // No applied migrations
 
         for (auto it = migrations_.rbegin(); it != migrations_.rend(); ++it) {
             if (it->version == *ver_r) {
@@ -329,7 +333,7 @@ public:
         co_return unexpected(migration_error(4));
     }
 
-    // ── 특정 버전까지 롤백 (그 버전 포함하여 제거) ──────────────────────────
+    // ── Roll back to a specific version (removing that version too) ──────────
 
     Task<Result<void>> rollback_to(uint64_t target_version) {
         auto ver_r = co_await current_version();
@@ -349,7 +353,7 @@ private:
     IConnection&           conn_;
     PlaceholderStyle       style_;
 
-    // ── 적용된 버전 일괄 로드 (N+1 쿼리 방지) ────────────────────────────────
+    // ── Bulk-load applied versions (avoids N+1 queries) ──────────────────────
 
     Task<Result<std::unordered_set<uint64_t>>> load_applied_set() {
         const std::string sql =
@@ -365,7 +369,7 @@ private:
         co_return applied;
     }
 
-    // ── 플레이스홀더 ─────────────────────────────────────────────────────────
+    // ── Placeholder ──────────────────────────────────────────────────────────
 
     [[nodiscard]] std::string ph(int n) const {
         if (style_ == PlaceholderStyle::Dollar)
@@ -373,7 +377,7 @@ private:
         return "?";
     }
 
-    // ── 타임스탬프 타입 (드라이버별) ─────────────────────────────────────────
+    // ── Timestamp type (per driver) ──────────────────────────────────────────
 
     [[nodiscard]] std::string_view timestamp_type() const noexcept {
         return (style_ == PlaceholderStyle::Dollar)
@@ -387,14 +391,14 @@ private:
             : "CURRENT_TIMESTAMP"; // MySQL / SQLite
     }
 
-    // ── 단일 마이그레이션 적용 ───────────────────────────────────────────────
+    // ── Apply a single migration ─────────────────────────────────────────────
 
     Task<Result<void>> apply_one(const Migration& m) {
         auto txn_r = co_await conn_.begin(IsolationLevel::ReadCommitted);
         if (!txn_r) co_return unexpected(migration_error(2));
         auto& txn = *txn_r;
 
-        // up SQL 문장들 실행
+        // Execute the up SQL statements
         for (auto stmt : split_sql(m.up)) {
             auto r = co_await txn->execute(stmt, {});
             if (!r) {
@@ -403,14 +407,15 @@ private:
             }
         }
 
-        // 이력 기록
+        // Record history
         const std::string insert = std::format(
             "INSERT INTO __schema_migrations(version, description) VALUES ({}, {})",
             ph(1), ph(2));
-        auto ins_r = co_await txn->execute(insert, {
+        const Value ins_params[] = {
             Value{static_cast<int64_t>(m.version)},
             Value{std::string_view{m.description}},
-        });
+        };
+        auto ins_r = co_await txn->execute(insert, ins_params);
         if (!ins_r) {
             co_await txn->rollback();
             co_return unexpected(migration_error(2));
@@ -421,7 +426,7 @@ private:
         co_return {};
     }
 
-    // ── 단일 마이그레이션 롤백 ───────────────────────────────────────────────
+    // ── Roll back a single migration ─────────────────────────────────────────
 
     Task<Result<void>> rollback_one(const Migration& m) {
         if (m.down.empty())
@@ -439,12 +444,11 @@ private:
             }
         }
 
-        // 이력 제거
+        // Remove history
         const std::string del = std::format(
             "DELETE FROM __schema_migrations WHERE version = {}", ph(1));
-        auto del_r = co_await txn->execute(del, {
-            Value{static_cast<int64_t>(m.version)},
-        });
+        const Value del_params[] = {Value{static_cast<int64_t>(m.version)}};
+        auto del_r = co_await txn->execute(del, del_params);
         if (!del_r) {
             co_await txn->rollback();
             co_return unexpected(migration_error(3));

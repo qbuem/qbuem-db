@@ -76,9 +76,16 @@ jobs:
         options: >-
           --health-cmd "mysqladmin ping -h127.0.0.1 -uroot -ptest"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 12
     env:
       PG_DSN: "postgresql://postgres:test@127.0.0.1:5432/testdb"
       MYSQL_DSN: "mysql://root:test@127.0.0.1:3306/test"
+      REDIS_DSN: "redis://127.0.0.1:6379"
     steps:
       - uses: actions/checkout@v6
       - name: Install dev libraries
@@ -96,3 +103,4 @@ jobs:
           echo "::group::sqlite";     g++-13 -std=c++23 $INC $IT/test_sqlite_integration.cpp     src/qbuem/db/sqlite3_driver.cpp    $RX -lsqlite3      -o it_sqlite && ./it_sqlite;         echo "::endgroup::"
           echo "::group::postgresql"; g++-13 -std=c++23 $INC $IT/test_postgresql_integration.cpp src/qbuem/db/postgresql_driver.cpp $RX -lpq           -o it_pg     && ./it_pg;             echo "::endgroup::"
           echo "::group::mysql";      g++-13 -std=c++23 $INC $IT/test_mysql_integration.cpp      src/qbuem/db/mysql_driver.cpp      $RX -lmysqlclient -o it_mysql && ./it_mysql;          echo "::endgroup::"
+          echo "::group::redis";      g++-13 -std=c++23 $INC $IT/test_redis_integration.cpp      src/qbuem/db/redis_client.cpp      $RX               -o it_redis && ./it_redis;          echo "::endgroup::"

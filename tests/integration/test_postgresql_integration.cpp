@@ -23,6 +23,9 @@ int main() {
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
         co_await qbuem_db_it::multi_connection_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
+        co_await qbuem_db_it::migration_suite(
+            *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
+            qbuem_routine::migration::PlaceholderStyle::Dollar);
         co_await qbuem_db_it::drain_safety_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
     });

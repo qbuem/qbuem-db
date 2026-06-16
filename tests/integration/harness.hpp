@@ -10,6 +10,7 @@
 #include <qbuem/db/driver.hpp>
 #include <qbuem/db/value.hpp>
 #include "qbuem/db/orm.hpp"
+#include "qbuem/db/migration/migrator.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -430,6 +431,97 @@ inline Task<void> orm_suite(IDBDriver& driver, std::string dsn,
             IT_CHECK(row && row->get(0).get<int64_t>() == 0);
         }
     }
+    co_return;
+}
+
+// Drives the schema-migration runner end-to-end: apply, status, rollback and
+// re-apply against a real driver. `style` selects the placeholder/timestamp
+// dialect (Dollar for PostgreSQL, Question for MySQL/SQLite). DDL is portable
+// across all three backends.
+inline Task<void> migration_suite(IDBDriver& driver, std::string dsn,
+                                  qbuem_routine::migration::PlaceholderStyle style) {
+    namespace mig = qbuem_routine::migration;
+
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn_ptr = std::move(*conn_r);
+    IConnection& conn = *conn_ptr;
+
+    // Clean slate — real servers persist tables across runs.
+    co_await conn.query("DROP TABLE IF EXISTS mig_users");
+    co_await conn.query("DROP TABLE IF EXISTS __schema_migrations");
+
+    std::vector<mig::Migration> migrations = {
+        mig::Migration{
+            .version     = 1,
+            .description = "create mig_users",
+            .up   = "CREATE TABLE mig_users (id BIGINT PRIMARY KEY, email TEXT NOT NULL)",
+            .down = "DROP TABLE mig_users",
+        },
+        mig::Migration{
+            .version     = 2,
+            .description = "add nickname",
+            .up   = "ALTER TABLE mig_users ADD COLUMN nickname TEXT",
+            .down = "ALTER TABLE mig_users DROP COLUMN nickname",
+        },
+    };
+
+    mig::MigrationRunner runner{migrations, conn, style};
+
+    // Apply all pending migrations.
+    {
+        auto r = co_await runner.migrate();
+        IT_CHECK(r.has_value());
+        if (r) {
+            IT_CHECK(r->applied == 2);
+            IT_CHECK(r->latest == 2);
+        }
+        auto v = co_await runner.current_version();
+        IT_CHECK(v.has_value() && *v == 2);
+    }
+
+    // The migrated schema works (insert uses the v2 column). $N is converted to ?
+    // by the MySQL/SQLite drivers, so the same SQL works on every backend.
+    {
+        const Value row[] = {Value{int64_t{1}}, Value{std::string_view{"a@b.c"}},
+                             Value{std::string_view{"nick"}}};
+        auto ins = co_await conn.query(
+            "INSERT INTO mig_users(id, email, nickname) VALUES($1, $2, $3)", row);
+        IT_CHECK(ins.has_value());
+    }
+
+    // Status reports both as applied.
+    {
+        auto s = co_await runner.status();
+        IT_CHECK(s.has_value() && s->size() == 2);
+        if (s && s->size() == 2) IT_CHECK((*s)[0].applied && (*s)[1].applied);
+    }
+
+    // Roll back the last migration → current version drops to 1.
+    {
+        auto r = co_await runner.rollback();
+        IT_CHECK(r.has_value());
+        auto v = co_await runner.current_version();
+        IT_CHECK(v.has_value() && *v == 1);
+    }
+
+    // Re-migrate → v2 is re-applied, v1 skipped.
+    {
+        auto r = co_await runner.migrate();
+        IT_CHECK(r.has_value());
+        if (r) {
+            IT_CHECK(r->applied == 1);
+            IT_CHECK(r->skipped == 1);
+        }
+    }
+
+    co_await conn.query("DROP TABLE IF EXISTS mig_users");
+    co_await conn.query("DROP TABLE IF EXISTS __schema_migrations");
     co_return;
 }
 

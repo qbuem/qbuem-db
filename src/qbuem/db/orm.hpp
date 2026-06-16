@@ -2,18 +2,21 @@
 
 /**
  * @file db/orm.hpp
- * @brief 제너릭 ORM 유틸리티 — qbuem::db::IRow 기반 (드라이버 독립)
+ * @brief Generic ORM utilities — based on qbuem::db::IRow (driver-independent)
  *
- * ## 성능 설계
- * - col_list, placeholder, upsert 구문은 빌더 단계에서 1회 계산, 이후 O(1) 접근
- * - 자주 쓰는 SQL (select_all, insert, update_pk, delete_pk, upsert_pk) 도 캐싱
- * - sql_insert_batch() / in_placeholders() 은 사전 할당 + 직접 문자 삽입으로 최적화
- * - ph(n)은 $1..$64 구간 정적 배열, 이외 fallback to to_string
+ * ## Performance design
+ * - col_list, placeholder, and upsert clauses are computed once at the builder
+ *   stage, then accessed in O(1)
+ * - Frequently used SQL (select_all, insert, update_pk, delete_pk, upsert_pk) is
+ *   cached as well
+ * - sql_insert_batch() / in_placeholders() are optimized via pre-allocation +
+ *   direct character insertion
+ * - ph(n) uses a static array for the $1..$64 range, otherwise falls back to to_string
  *
- * ## 드라이버별 Dialect 설정
+ * ## Per-driver Dialect configuration
  * ```cpp
  * orm::register_table<User>("users")
- *     .dialect(Dialect::MySQL)   // 기본값: PostgreSQL
+ *     .dialect(Dialect::MySQL)   // default: PostgreSQL
  *     .pk("id",    &User::id)
  *     .col("email", &User::email);
  * ```
@@ -38,18 +41,18 @@
 
 namespace qbuem_routine::orm {
 
-// ── 타입 별칭 ─────────────────────────────────────────────────────────────────
+// ── Type aliases ──────────────────────────────────────────────────────────────
 using Value = qbuem::db::Value;
 
-// ── Dialect — DB 방언 ─────────────────────────────────────────────────────────
+// ── Dialect — DB dialect ───────────────────────────────────────────────────────
 
 enum class Dialect {
-    PostgreSQL,  ///< $N 플레이스홀더, RETURNING *, ON CONFLICT … EXCLUDED
-    MySQL,       ///< ? 플레이스홀더, RETURNING 없음, ON DUPLICATE KEY UPDATE
-    SQLite,      ///< ? 플레이스홀더, RETURNING 없음, ON CONFLICT … EXCLUDED
+    PostgreSQL,  ///< $N placeholders, RETURNING *, ON CONFLICT … EXCLUDED
+    MySQL,       ///< ? placeholders, no RETURNING, ON DUPLICATE KEY UPDATE
+    SQLite,      ///< ? placeholders, no RETURNING, ON CONFLICT … EXCLUDED
 };
 
-// ── 지원 스칼라 타입 컨셉 ────────────────────────────────────────────────────
+// ── Supported scalar type concepts ───────────────────────────────────────────
 
 template<typename T>
 concept OrmInt = std::same_as<T, int64_t> || std::same_as<T, int32_t> ||
@@ -75,7 +78,7 @@ concept OrmOptional = requires { typename T::value_type; } &&
 template<typename T>
 concept OrmField = OrmScalar<T> || OrmOptional<T>;
 
-// ── Value 변환 헬퍼 ──────────────────────────────────────────────────────────
+// ── Value conversion helpers ─────────────────────────────────────────────────
 
 template<OrmScalar F>
 [[nodiscard]] Value to_value(const F& v) {
@@ -105,7 +108,7 @@ template<OrmScalar F>
     return from_value<F>(v);
 }
 
-// ── FieldDef — 필드 메타데이터 ────────────────────────────────────────────────
+// ── FieldDef — field metadata ─────────────────────────────────────────────────
 
 template<typename T>
 struct FieldDef {
@@ -135,9 +138,9 @@ public:
         (void)ident(table_);
     }
 
-    // ── 빌더 API ─────────────────────────────────────────────────────────────
+    // ── Builder API ────────────────────────────────────────────────────────────
 
-    /// DB 방언 설정 (기본값: PostgreSQL). dialect() 호출 후 placeholder 캐시 재생성.
+    /// Set the DB dialect (default: PostgreSQL). Rebuilds the placeholder cache after dialect() is called.
     TableMeta& dialect(Dialect d) {
         dialect_ = d;
         rebuild_dialect_caches();
@@ -147,7 +150,7 @@ public:
     template<OrmField F>
     TableMeta& pk(std::string col, F T::* ptr) {
         pk_ = col;
-        // col_list_all에 PK도 포함
+        // Include the PK in col_list_all as well
         if (!cache_.col_list_all.empty()) cache_.col_list_all += ", ";
         cache_.col_list_all += col;
         fields_.push_back(make_field<F>(std::move(col), ptr, true));
@@ -209,16 +212,16 @@ public:
         return *this;
     }
 
-    // ── 메타 접근자 ──────────────────────────────────────────────────────────
+    // ── Meta accessors ─────────────────────────────────────────────────────────
 
     [[nodiscard]] std::string_view table_name()  const noexcept { return table_; }
     [[nodiscard]] std::string_view pk_col()      const noexcept { return pk_; }
     [[nodiscard]] std::size_t      field_count() const noexcept { return fields_.size(); }
     [[nodiscard]] Dialect          get_dialect() const noexcept { return dialect_; }
 
-    // ── SQL 생성 — 기본 SELECT ────────────────────────────────────────────────
+    // ── SQL generation — basic SELECT ─────────────────────────────────────────
 
-    /// SELECT col1, col2, ... FROM table  [캐싱됨]
+    /// SELECT col1, col2, ... FROM table  [cached]
     [[nodiscard]] const std::string& sql_select_all() const noexcept {
         return cache_.sql_select_all;
     }
@@ -277,7 +280,7 @@ public:
         return cache_.sql_select_all + " WHERE " + std::string(ident(col)) + " LIKE " + ph_sv(p);
     }
 
-    // ── SQL 생성 — 페이지네이션 ───────────────────────────────────────────────
+    // ── SQL generation — pagination ───────────────────────────────────────────
 
     /// SELECT ... FROM table LIMIT $lp OFFSET $op
     [[nodiscard]] std::string sql_select_paged(int limit_p = 1, int offset_p = 2) const {
@@ -302,7 +305,7 @@ public:
                " LIMIT " + ph_sv(limit_p) + " OFFSET " + ph_sv(offset_p);
     }
 
-    // ── SQL 생성 — COUNT ─────────────────────────────────────────────────────
+    // ── SQL generation — COUNT ───────────────────────────────────────────────
 
     /// SELECT COUNT(*) FROM table
     [[nodiscard]] std::string sql_count() const {
@@ -327,7 +330,7 @@ public:
                " IN (" + in_placeholders(n, start_p) + ")";
     }
 
-    // ── SQL 생성 — 멀티 컬럼 WHERE ───────────────────────────────────────────
+    // ── SQL generation — multi-column WHERE ──────────────────────────────────
 
     /// SELECT ... WHERE c1=$1 AND c2=$2 AND ...
     [[nodiscard]] std::string sql_select_where_multi(std::span<const std::string_view> cols,
@@ -363,14 +366,14 @@ public:
                std::string(ident(col3)) + " = " + ph_sv(p3);
     }
 
-    // ── SQL 생성 — INSERT / UPSERT ────────────────────────────────────────────
+    // ── SQL generation — INSERT / UPSERT ──────────────────────────────────────
 
-    /// INSERT INTO table(…) VALUES (…) [RETURNING *]  [캐싱됨]
+    /// INSERT INTO table(…) VALUES (…) [RETURNING *]  [cached]
     [[nodiscard]] const std::string& sql_insert() const noexcept {
         return cache_.sql_insert;
     }
 
-    /// INSERT INTO table(…) VALUES (…) [RETURNING *] (returning 명시 오버로드)
+    /// INSERT INTO table(…) VALUES (…) [RETURNING *] (explicit-returning overload)
     [[nodiscard]] std::string sql_insert(bool returning) const {
         if (returning == supports_returning()) return cache_.sql_insert;
         // Rare: caller explicitly requests opposite of dialect default
@@ -412,25 +415,25 @@ public:
         return sql;
     }
 
-    /// UPSERT — 방언별 자동 선택  [캐싱됨]
+    /// UPSERT — auto-selected per dialect  [cached]
     [[nodiscard]] const std::string& sql_upsert_pk() const noexcept {
         return cache_.sql_upsert_pk;
     }
 
-    /// UPSERT (returning 명시 오버로드)
+    /// UPSERT (explicit-returning overload)
     [[nodiscard]] std::string sql_upsert_pk(bool returning) const {
         if (returning == supports_returning()) return cache_.sql_upsert_pk;
         return build_upsert_pk(returning);
     }
 
-    // ── SQL 생성 — UPDATE ─────────────────────────────────────────────────────
+    // ── SQL generation — UPDATE ─────────────────────────────────────────────────
 
-    /// UPDATE table SET … WHERE pk=$N [RETURNING *]  [캐싱됨]
+    /// UPDATE table SET … WHERE pk=$N [RETURNING *]  [cached]
     [[nodiscard]] const std::string& sql_update_pk() const noexcept {
         return cache_.sql_update_pk;
     }
 
-    /// UPDATE table SET … WHERE pk=$N [RETURNING *] (returning 명시)
+    /// UPDATE table SET … WHERE pk=$N [RETURNING *] (explicit returning)
     [[nodiscard]] std::string sql_update_pk(bool returning) const {
         if (returning == supports_returning()) return cache_.sql_update_pk;
         return build_update_pk(returning);
@@ -445,9 +448,9 @@ public:
         return sql;
     }
 
-    // ── SQL 생성 — DELETE ─────────────────────────────────────────────────────
+    // ── SQL generation — DELETE ─────────────────────────────────────────────────
 
-    /// DELETE FROM table WHERE pk=$1  [캐싱됨]
+    /// DELETE FROM table WHERE pk=$1  [cached]
     [[nodiscard]] const std::string& sql_delete_pk() const noexcept {
         return cache_.sql_delete_pk;
     }
@@ -464,7 +467,7 @@ public:
                " AND " + std::string(ident(col2)) + " = " + ph_sv(2);
     }
 
-    // ── 파라미터 바인딩 ───────────────────────────────────────────────────────
+    // ── Parameter binding ───────────────────────────────────────────────────────
 
     // INSERT: non-PK, non-readonly fields only (registration order)
     [[nodiscard]] std::vector<Value> bind_insert(const T& v) const {
@@ -502,7 +505,7 @@ public:
         return params;
     }
 
-    /// PK만 바인딩
+    /// Bind PK only
     [[nodiscard]] std::vector<Value> bind_pk(const T& v) const {
         for (const auto& f : fields_) {
             if (f.is_pk) return {f.to_val(v)};
@@ -510,25 +513,25 @@ public:
         return {};
     }
 
-    /// 단일 값 바인딩
+    /// Bind a single value
     template<OrmScalar F>
     [[nodiscard]] std::vector<Value> bind_val(const F& v) const {
         return {to_value(v)};
     }
 
-    /// 2개 값 바인딩
+    /// Bind two values
     template<OrmScalar F1, OrmScalar F2>
     [[nodiscard]] std::vector<Value> bind_val2(const F1& v1, const F2& v2) const {
         return {to_value(v1), to_value(v2)};
     }
 
-    /// 3개 값 바인딩
+    /// Bind three values
     template<OrmScalar F1, OrmScalar F2, OrmScalar F3>
     [[nodiscard]] std::vector<Value> bind_val3(const F1& v1, const F2& v2, const F3& v3) const {
         return {to_value(v1), to_value(v2), to_value(v3)};
     }
 
-    /// WHERE + LIMIT + OFFSET 바인딩
+    /// Bind WHERE + LIMIT + OFFSET
     template<OrmScalar F>
     [[nodiscard]] std::vector<Value> bind_paged(const F& where_val,
                                                  int64_t limit,
@@ -536,7 +539,7 @@ public:
         return {to_value(where_val), Value{limit}, Value{offset}};
     }
 
-    /// IN 절용 바인딩: 임의 범위 컨테이너 지원
+    /// Bind for an IN clause: supports arbitrary range containers
     template<std::ranges::input_range R>
         requires OrmScalar<std::ranges::range_value_t<R>>
     [[nodiscard]] std::vector<Value> bind_in(R&& values) const {
@@ -548,9 +551,9 @@ public:
         return params;
     }
 
-    // ── 결과 행 읽기 ─────────────────────────────────────────────────────────
+    // ── Reading result rows ────────────────────────────────────────────────────
 
-    /// IRow → T: 컬럼명 기반 매핑
+    /// IRow → T: column-name-based mapping
     [[nodiscard]] T read_row(const qbuem::db::IRow& row) const {
         T obj{};
         for (const auto& f : fields_) {
@@ -561,7 +564,7 @@ public:
         return obj;
     }
 
-    /// IRow → T: 인덱스 기반 매핑 (등록 순서 == SELECT 컬럼 순서일 때, 더 빠름)
+    /// IRow → T: index-based mapping (faster when registration order == SELECT column order)
     [[nodiscard]] T read_row_indexed(const qbuem::db::IRow& row) const {
         T obj{};
         for (std::size_t i = 0; i < fields_.size(); ++i) {
@@ -573,7 +576,7 @@ public:
     }
 
 private:
-    // ── 멤버 ─────────────────────────────────────────────────────────────────
+    // ── Members ────────────────────────────────────────────────────────────────
 
     std::string              table_;
     std::string              pk_;
@@ -581,15 +584,15 @@ private:
     std::size_t              non_pk_count_{0};
     Dialect                  dialect_{Dialect::PostgreSQL};
 
-    // 캐싱된 빌딩 블록 + 완성 SQL (빌더 단계에서 1회 계산)
+    // Cached building blocks + fully built SQL (computed once at the builder stage)
     struct Cache {
-        // 헬퍼 조각들
+        // Helper fragments
         std::string col_list_all;
         std::string col_list_no_pk;
         std::string placeholders_no_pk;
         std::string upsert_excluded;   // "col = EXCLUDED.col, …"
         std::string upsert_values;     // "col = VALUES(col), …"
-        // 완성 SQL
+        // Fully built SQL
         std::string sql_select_all;
         std::string sql_insert;
         std::string sql_upsert_pk;
@@ -597,9 +600,9 @@ private:
         std::string sql_delete_pk;
     } cache_;
 
-    // ── 플레이스홀더 헬퍼 ────────────────────────────────────────────────────
+    // ── Placeholder helpers ──────────────────────────────────────────────────
 
-    // PostgreSQL 플레이스홀더 정적 배열 ($1..$64 공통 범위)
+    // Static array of PostgreSQL placeholders (common $1..$64 range)
     static constexpr std::string_view kPgPh[] = {
         "$1","$2","$3","$4","$5","$6","$7","$8","$9","$10",
         "$11","$12","$13","$14","$15","$16","$17","$18","$19","$20",
@@ -610,7 +613,7 @@ private:
         "$61","$62","$63","$64",
     };
 
-    /// 플레이스홀더 std::string 반환 (캐시에 append할 때 사용)
+    /// Return a placeholder std::string (used when appending to the cache)
     [[nodiscard]] std::string ph_sv(int n) const {
         if (dialect_ == Dialect::PostgreSQL) {
             if (n >= 1 && n <= 64) return std::string{kPgPh[n - 1]};
@@ -619,10 +622,10 @@ private:
         return "?";
     }
 
-    /// 플레이스홀더 반환 — sql_insert_batch 내부 루프용 (반환값 string)
+    /// Return a placeholder — for the inner loop of sql_insert_batch (returns string)
     [[nodiscard]] static std::string_view ph_sv_int(int n) noexcept {
         if (n >= 1 && n <= 64) return kPgPh[n - 1];
-        return {};  // 호출자가 fallback 처리
+        return {};  // caller handles the fallback
     }
 
     [[nodiscard]] bool supports_returning() const noexcept {
@@ -679,12 +682,12 @@ private:
         return s;
     }
 
-    // ── IN 플레이스홀더 빌더 (최적화) ────────────────────────────────────────
+    // ── IN placeholder builder (optimized) ───────────────────────────────────
 
     [[nodiscard]] std::string in_placeholders(std::size_t n, int start_p) const {
         if (n == 0) return {};
         if (dialect_ != Dialect::PostgreSQL) {
-            // 모두 '?' — "?,?,?" 패턴 직접 구성
+            // All '?' — build the "?,?,?" pattern directly
             std::string r;
             r.reserve(n * 2 - 1);
             for (std::size_t i = 0; i < n; ++i) {
@@ -709,11 +712,11 @@ private:
         return r;
     }
 
-    // ── 캐시 재생성 ──────────────────────────────────────────────────────────
+    // ── Cache rebuilds ─────────────────────────────────────────────────────────
 
-    /// dialect 변경 시 dialect-dependent 캐시만 재생성
+    /// On a dialect change, rebuild only the dialect-dependent caches
     void rebuild_dialect_caches() {
-        // placeholders_no_pk 재생성
+        // Rebuild placeholders_no_pk
         cache_.placeholders_no_pk.clear();
         int p = 1;
         for (const auto& f : fields_) {
@@ -724,7 +727,7 @@ private:
         rebuild_stable_sqls();
     }
 
-    /// 모든 안정적 SQL 재생성 (pk/col 추가 또는 dialect 변경 시 호출)
+    /// Rebuild all stable SQL (called when a pk/col is added or the dialect changes)
     void rebuild_stable_sqls() {
         // SELECT *
         if (!table_.empty() && !cache_.col_list_all.empty())
@@ -786,7 +789,7 @@ private:
         return sql;
     }
 
-    // ── 필드 팩토리 ──────────────────────────────────────────────────────────
+    // ── Field factory ──────────────────────────────────────────────────────────
 
     template<OrmScalar F>
     static FieldDef<T> make_field(std::string col_name, F T::* ptr, bool is_pk) {
@@ -810,7 +813,7 @@ private:
     }
 };
 
-// ── 전역 레지스트리 ─────────────────────────────────────────────────────────
+// ── Global registry ───────────────────────────────────────────────────────────
 
 template<typename T>
 inline std::optional<TableMeta<T>> g_meta;
