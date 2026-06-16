@@ -2,42 +2,43 @@
 
 /**
  * @file db/redis_client.hpp
- * @brief 비동기 Redis 클라이언트 — qbuem Reactor 기반 RESP2 구현.
+ * @brief Async Redis client — RESP2 over the qbuem Reactor.
  *
- * 외부 의존성 없음: 순수 POSIX TCP 소켓 + RESP2 프로토콜 직접 구현.
- * qbuem Reactor 이벤트 루프와 코루틴으로 통합됩니다.
+ * No external dependencies: raw POSIX TCP sockets + a hand-written RESP2
+ * protocol. Integrates with the qbuem Reactor event loop via coroutines.
  *
- * DSN 형식:
- *   redis://host:port                  (기본 포트 6379)
- *   redis://host                       (포트 생략)
- *   redis://:password@host:port        (인증)
- *   redis://user:password@host:port/db (사용자 + 인증 + DB 번호)
- *   redis://host:port/2                (DB 번호 2 선택)
+ * DSN forms:
+ *   redis://host:port                  (default port 6379)
+ *   redis://host                       (port omitted)
+ *   redis://:password@host:port        (auth)
+ *   redis://user:password@host:port/db (user + auth + DB number)
+ *   redis://host:port/2                (select DB number 2)
  *
- * 클라우드 호환:
+ * Cloud-compatible:
  *   - Amazon ElastiCache (Redis OSS)
- *   - Upstash (서버리스 Redis)
+ *   - Upstash (serverless Redis)
  *   - Redis Cloud
  *   - Google Cloud Memorystore (Redis)
  *   - Azure Cache for Redis
  *
- * 지원 명령:
- *   문자열: GET, SET (TTL 포함), GETSET, SETNX, DEL, EXISTS, EXPIRE,
- *           TTL, PTTL, INCR, INCRBY, DECR, DECRBY, MGET, MSET
- *   해시:   HGET, HSET, HSETNX, HDEL, HGETALL, HKEYS, HVALS, HEXISTS, HLEN
- *   리스트: LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX
- *   셋:    SADD, SREM, SMEMBERS, SCARD, SISMEMBER
- *   정렬셋: ZADD, ZREM, ZRANGE, ZRANGEBYSCORE, ZSCORE, ZCARD, ZRANK
- *   기타:  KEYS, SCAN, TYPE, RENAME, PERSIST, PING, FLUSHDB, INFO
+ * Supported commands:
+ *   strings:     GET, SET (with TTL), GETSET, SETNX, DEL, EXISTS, EXPIRE,
+ *                TTL, PTTL, INCR, INCRBY, DECR, DECRBY, MGET, MSET
+ *   hashes:      HGET, HSET, HSETNX, HDEL, HGETALL, HKEYS, HVALS, HEXISTS, HLEN
+ *   lists:       LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX
+ *   sets:        SADD, SREM, SMEMBERS, SCARD, SISMEMBER
+ *   sorted sets: ZADD, ZREM, ZRANGE, ZRANGEBYSCORE, ZSCORE, ZCARD, ZRANK
+ *   transactions: MULTI, EXEC, DISCARD, WATCH, UNWATCH
+ *   misc:        KEYS, SCAN, TYPE, RENAME, PERSIST, PING, FLUSHDB, INFO
  *
- * 사용 예:
+ * Usage:
  * ```cpp
  * #include "db/redis_client.hpp"
  *
  * auto client = co_await redis::RedisClient::connect("redis://localhost:6379");
  * if (!client) { handle_error(client.error()); }
  *
- * co_await (*client)->set("key", "value", 3600);  // TTL 1시간
+ * co_await (*client)->set("key", "value", 3600);  // TTL: 1 hour
  * auto val = co_await (*client)->get("key");
  * // val → RedisValue{Type::String, "value"}
  * ```
@@ -61,21 +62,21 @@ namespace qbuem_routine::redis {
 using qbuem::Result;
 using qbuem::unexpected;
 
-// ── RedisValue — Redis 응답 타입 ─────────────────────────────────────────────
+// ── RedisValue — a Redis reply ───────────────────────────────────────────────
 
 struct RedisValue {
     enum class Type {
         Null,       ///< nil / null bulk
-        String,     ///< bulk string 또는 simple string
+        String,     ///< bulk string or simple string
         Integer,    ///< :integer
-        Array,      ///< *n 배열
+        Array,      ///< *n array
         Error,      ///< -error
     };
 
     Type                          type{Type::Null};
-    std::string                   str;           ///< String / Error 값
-    int64_t                       integer{0};    ///< Integer 값
-    std::vector<RedisValue>       array;         ///< Array 원소
+    std::string                   str;           ///< String / Error value
+    int64_t                       integer{0};    ///< Integer value
+    std::vector<RedisValue>       array;         ///< Array elements
 
     [[nodiscard]] bool   is_null()    const noexcept { return type == Type::Null; }
     [[nodiscard]] bool   is_ok()      const noexcept {
@@ -87,7 +88,7 @@ struct RedisValue {
         return is_ok();
     }
 
-    // 편의 접근자
+    // convenience accessors
     [[nodiscard]] std::string_view   as_string()  const noexcept { return str; }
     [[nodiscard]] int64_t            as_int()     const noexcept { return integer; }
     [[nodiscard]] const std::vector<RedisValue>& as_array() const noexcept { return array; }
@@ -107,15 +108,15 @@ public:
     RedisClient(const RedisClient&)            = delete;
     RedisClient& operator=(const RedisClient&) = delete;
 
-    /// Redis 서버에 비동기 연결 (Reactor::current() 필요)
+    /// Async connect to a Redis server (requires Reactor::current()).
     [[nodiscard]] static qbuem::Task<Result<std::unique_ptr<RedisClient>>>
     connect(std::string_view dsn);
 
-    // ── 연결 관리 ────────────────────────────────────────────────────────────
+    // ── Connection management ─────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<RedisValue>> ping();
 
-    // ── 문자열 명령 ──────────────────────────────────────────────────────────
+    // ── String commands ──────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<RedisValue>> get(std::string_view key);
 
@@ -137,11 +138,11 @@ public:
     [[nodiscard]] qbuem::Task<Result<int64_t>> decr(std::string_view key);
     [[nodiscard]] qbuem::Task<Result<int64_t>> decrby(std::string_view key, int64_t delta);
 
-    /// MGET key [key ...] → 순서 대응 optional<string> 벡터
+    /// MGET key [key ...] → vector of optional<string>, positionally aligned
     [[nodiscard]] qbuem::Task<Result<std::vector<std::optional<std::string>>>>
     mget(std::vector<std::string> keys);
 
-    // ── 해시 명령 ─────────────────────────────────────────────────────────────
+    // ── Hash commands ─────────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<std::optional<std::string>>>
     hget(std::string_view key, std::string_view field);
@@ -164,7 +165,7 @@ public:
     [[nodiscard]] qbuem::Task<Result<int64_t>>
     hlen(std::string_view key);
 
-    // ── 리스트 명령 ──────────────────────────────────────────────────────────
+    // ── List commands ────────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<int64_t>>
     lpush(std::string_view key, std::string_view value);
@@ -184,7 +185,7 @@ public:
     [[nodiscard]] qbuem::Task<Result<int64_t>>
     llen(std::string_view key);
 
-    // ── 셋 명령 ──────────────────────────────────────────────────────────────
+    // ── Set commands ─────────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<int64_t>>
     sadd(std::string_view key, std::string_view member);
@@ -201,7 +202,7 @@ public:
     [[nodiscard]] qbuem::Task<Result<bool>>
     sismember(std::string_view key, std::string_view member);
 
-    // ── 정렬 셋 명령 ─────────────────────────────────────────────────────────
+    // ── Sorted-set commands ──────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<int64_t>>
     zadd(std::string_view key, double score, std::string_view member);
@@ -247,14 +248,14 @@ public:
     [[nodiscard]] qbuem::Task<Result<RedisValue>>
     transaction(std::vector<std::vector<std::string>> commands);
 
-    // ── 기타 ─────────────────────────────────────────────────────────────────
+    // ── Misc ──────────────────────────────────────────────────────────────────
 
     [[nodiscard]] qbuem::Task<Result<std::string>> type(std::string_view key);
     [[nodiscard]] qbuem::Task<Result<std::vector<std::string>>> keys(std::string_view pattern);
     [[nodiscard]] qbuem::Task<Result<RedisValue>>  info();
     [[nodiscard]] qbuem::Task<Result<RedisValue>>  flushdb();
 
-    /// 임의 명령 실행 (확장용)
+    /// Run an arbitrary command (extension point).
     [[nodiscard]] qbuem::Task<Result<RedisValue>>
     command(std::vector<std::string> args);
 
