@@ -8,5 +8,6 @@ int main() {
         co_await qbuem_db_it::basic_suite(
             *driver, "sqlite://:memory:",
             "CREATE TABLE itest(id INTEGER PRIMARY KEY, name TEXT)");
+        co_await qbuem_db_it::drain_safety_suite(*driver, "sqlite://:memory:");
     });
 }

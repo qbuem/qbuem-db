@@ -120,6 +120,32 @@ inline Task<void> basic_suite(IDBDriver& driver, std::string dsn, std::string cr
     co_return;
 }
 
+// Pool-shutdown safety: a connection acquired from the pool must remain safe to
+// use (and destroy) even after the pool is drained — draining must not free the
+// underlying handle out from under a live connection (use-after-free).
+inline Task<void> drain_safety_suite(IDBDriver& driver, std::string dsn) {
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    // Drain the pool while `conn` is still alive.
+    co_await pool->drain();
+
+    // Using the connection after drain must not be a use-after-free.  It may
+    // return an error, but it must not touch freed memory / crash.
+    auto r = co_await conn->query("SELECT 1");
+    IT_CHECK(true); // reaching here without an ASan abort is the real assertion
+    (void)r;
+    // conn destructs here (also must not UAF on the drained handle).
+    co_return;
+}
+
 // Run `body` to completion; returns process exit code (0 = all checks passed).
 template <typename F>
 inline int run_main(F&& body) {
