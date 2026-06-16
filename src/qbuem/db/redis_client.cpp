@@ -784,4 +784,64 @@ RedisClient::transaction(std::vector<std::vector<std::string>> commands) {
 #undef RC_SEND
 #undef RC_CHECK
 
+// ── RedisPool ─────────────────────────────────────────────────────────────────
+
+PooledRedisConnection::~PooledRedisConnection() {
+    if (client_ && pool_) pool_->release(std::move(client_));
+}
+
+Task<Result<std::unique_ptr<RedisPool>>>
+RedisPool::create(std::string_view dsn, std::size_t size) {
+    const std::size_t target = size > 0 ? size : 4;
+    auto pool = std::unique_ptr<RedisPool>(new RedisPool(std::string(dsn), target));
+    for (std::size_t i = 0; i < target; ++i) {
+        auto cr = co_await RedisClient::connect(dsn);
+        if (!cr) {
+            if (i == 0) co_return unexpected(cr.error()); // cannot connect at all
+            break;                                        // accept a partial pool
+        }
+        pool->idle_.push_back(std::move(*cr));
+        ++pool->total_;
+    }
+    co_return pool;
+}
+
+Task<Result<PooledRedisConnection>> RedisPool::acquire() {
+    {
+        std::lock_guard lock{mutex_};
+        if (!idle_.empty()) {
+            auto client = std::move(idle_.back());
+            idle_.pop_back();
+            co_return PooledRedisConnection{std::move(client), this};
+        }
+        if (total_ >= max_size_)
+            co_return unexpected(db_error(DbError::PoolExhausted));
+        ++total_; // reserve the slot before the (async) connect, released on failure
+    }
+
+    auto cr = co_await RedisClient::connect(dsn_);
+    if (!cr) {
+        std::lock_guard lock{mutex_};
+        --total_;
+        co_return unexpected(cr.error());
+    }
+    co_return PooledRedisConnection{std::move(*cr), this};
+}
+
+void RedisPool::release(std::unique_ptr<RedisClient> client) noexcept {
+    if (!client) return;
+    std::lock_guard lock{mutex_};
+    idle_.push_back(std::move(client));
+}
+
+std::size_t RedisPool::idle_count() const noexcept {
+    std::lock_guard lock{mutex_};
+    return idle_.size();
+}
+
+std::size_t RedisPool::size() const noexcept {
+    std::lock_guard lock{mutex_};
+    return total_;
+}
+
 } // namespace qbuem_routine::redis

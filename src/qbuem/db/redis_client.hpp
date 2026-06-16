@@ -50,6 +50,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -259,6 +260,66 @@ public:
 
 private:
     std::unique_ptr<RedisClientImpl> impl_;
+};
+
+// ── RedisPool — connection pool for concurrent access ─────────────────────────
+//
+// A Redis connection processes commands serially, so concurrent workloads need
+// multiple connections.  RedisPool keeps a set of independent RedisClient
+// connections and hands them out via RAII PooledRedisConnection handles that
+// return to the pool when destroyed.
+
+class RedisPool;
+
+/// RAII handle to a pooled connection.  Use `->` / `*` to issue commands; the
+/// connection returns to the pool when this handle is destroyed.
+class PooledRedisConnection {
+public:
+    PooledRedisConnection(std::unique_ptr<RedisClient> client, RedisPool* pool) noexcept
+        : client_(std::move(client)), pool_(pool) {}
+    ~PooledRedisConnection();
+
+    PooledRedisConnection(PooledRedisConnection&&) noexcept            = default;
+    PooledRedisConnection& operator=(PooledRedisConnection&&) noexcept = default;
+    PooledRedisConnection(const PooledRedisConnection&)            = delete;
+    PooledRedisConnection& operator=(const PooledRedisConnection&) = delete;
+
+    [[nodiscard]] RedisClient* operator->() const noexcept { return client_.get(); }
+    [[nodiscard]] RedisClient& operator*()  const noexcept { return *client_; }
+    [[nodiscard]] RedisClient* get()        const noexcept { return client_.get(); }
+
+private:
+    std::unique_ptr<RedisClient> client_;
+    RedisPool*                   pool_;
+};
+
+class RedisPool {
+public:
+    /// Connect `size` clients to `dsn` up front.  Fails only if not even one
+    /// connection can be established (a partial pool is accepted).
+    [[nodiscard]] static qbuem::Task<Result<std::unique_ptr<RedisPool>>>
+    create(std::string_view dsn, std::size_t size = 4);
+
+    /// Check out a connection.  Reuses an idle one, else opens a new one up to the
+    /// pool's max size, else returns PoolExhausted.
+    [[nodiscard]] qbuem::Task<Result<PooledRedisConnection>> acquire();
+
+    /// Return a connection to the idle set (called by ~PooledRedisConnection).
+    void release(std::unique_ptr<RedisClient> client) noexcept;
+
+    [[nodiscard]] std::size_t max_size()   const noexcept { return max_size_; }
+    [[nodiscard]] std::size_t idle_count() const noexcept;
+    [[nodiscard]] std::size_t size()       const noexcept; ///< total live connections
+
+private:
+    RedisPool(std::string dsn, std::size_t max) noexcept
+        : dsn_(std::move(dsn)), max_size_(max) {}
+
+    std::string                               dsn_;
+    std::size_t                               max_size_;
+    mutable std::mutex                        mutex_;
+    std::vector<std::unique_ptr<RedisClient>> idle_;
+    std::size_t                               total_{0};
 };
 
 } // namespace qbuem_routine::redis

@@ -199,6 +199,37 @@ static qbuem::Task<void> redis_txn_suite(redis::RedisClient& c) {
     co_return;
 }
 
+// Exercises the Redis connection pool: multiple independent connections held at
+// once, reuse, and idle/size accounting.
+static qbuem::Task<void> redis_pool_suite(const std::string& url) {
+    auto pr = co_await redis::RedisPool::create(url, 3);
+    IT_CHECK(pr.has_value());
+    if (!pr) co_return;
+    auto pool = std::move(*pr);
+    IT_CHECK(pool->size() == 3);
+    IT_CHECK(pool->idle_count() == 3);
+
+    {
+        // Two connections checked out at once → two independent connections.
+        auto a = co_await pool->acquire();
+        auto b = co_await pool->acquire();
+        IT_CHECK(a.has_value());
+        IT_CHECK(b.has_value());
+        if (a && b) {
+            IT_CHECK(pool->idle_count() == 1); // 3 total − 2 checked out
+            IT_CHECK((co_await (*a)->set("pk", "pv")).has_value());
+            auto g = co_await (*b)->get("pk"); // same server, second connection
+            IT_CHECK(g.has_value() && g->as_string() == "pv");
+            auto p1 = co_await (*a)->ping();
+            auto p2 = co_await (*b)->ping();
+            IT_CHECK(p1.has_value() && p2.has_value()); // both usable at once
+        }
+        // a and b return to the pool here.
+    }
+    IT_CHECK(pool->idle_count() == 3); // both released
+    co_return;
+}
+
 int main() {
     const char* dsn = std::getenv("REDIS_DSN");
     std::string url = dsn ? dsn : "redis://127.0.0.1:6380";
@@ -209,5 +240,6 @@ int main() {
         auto cli = std::move(*cli_r);
         co_await redis_crud_suite(*cli);
         co_await redis_txn_suite(*cli);
+        co_await redis_pool_suite(url);
     });
 }
