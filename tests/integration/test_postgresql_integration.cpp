@@ -29,6 +29,9 @@ int main() {
         co_await qbuem_db_it::with_transaction_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
             "CREATE TABLE wtx(id BIGINT PRIMARY KEY, n BIGINT)");
+        co_await qbuem_db_it::streaming_suite(
+            *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
+            "CREATE TABLE strm(id BIGINT PRIMARY KEY, n BIGINT)");
         co_await qbuem_db_it::query_timeout_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
             "SELECT pg_sleep(2)");
