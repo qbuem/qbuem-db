@@ -85,6 +85,24 @@ static MysqlDsn parse_dsn(std::string_view dsn) {
 // $N → ? placeholder conversion: shared, string-literal-aware implementation.
 using qbuem_routine::db_detail::convert_placeholders;
 
+// Map MySQL's native error number to a transient (retryable) DbError where it
+// applies, else `fallback`. Lets with_transaction() retry real deadlocks /
+// lock-wait timeouts. 1213 = ER_LOCK_DEADLOCK, 1205 = ER_LOCK_WAIT_TIMEOUT.
+static DbError mysql_transient_or(MYSQL* db, DbError fallback) {
+    switch (mysql_errno(db)) {
+        case 1213: return DbError::Deadlock;
+        case 1205: return DbError::LockTimeout;
+        default:   return fallback;
+    }
+}
+static DbError mysql_stmt_transient_or(MYSQL_STMT* stmt, DbError fallback) {
+    switch (mysql_stmt_errno(stmt)) {
+        case 1213: return DbError::Deadlock;
+        case 1205: return DbError::LockTimeout;
+        default:   return fallback;
+    }
+}
+
 // ─── CellData ─────────────────────────────────────────────────────────────────
 
 struct CellData {
@@ -332,7 +350,7 @@ exec_stmt(MYSQL_STMT* stmt, std::span<const Value> params) {
         return unexpected(db_error(DbError::QueryFailed));
 
     if (mysql_stmt_execute(stmt))
-        return unexpected(db_error(DbError::QueryFailed));
+        return unexpected(db_error(mysql_stmt_transient_or(stmt, DbError::QueryFailed)));
 
     const uint64_t affected = static_cast<uint64_t>(mysql_stmt_affected_rows(stmt));
     const uint64_t last_id  = static_cast<uint64_t>(mysql_stmt_insert_id(stmt));
@@ -583,7 +601,7 @@ public:
 private:
     Result<void> exec_sql(const std::string& sql) {
         if (mysql_query(db_, sql.c_str()))
-            return unexpected(db_error(DbError::TransactionFailed));
+            return unexpected(db_error(mysql_transient_or(db_, DbError::TransactionFailed)));
         return {};
     }
 

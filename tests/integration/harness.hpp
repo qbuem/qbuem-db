@@ -11,6 +11,7 @@
 #include <qbuem/db/value.hpp>
 #include "qbuem/db/orm.hpp"
 #include "qbuem/db/migration/migrator.hpp"
+#include "qbuem/db/transaction.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -522,6 +523,82 @@ inline Task<void> migration_suite(IDBDriver& driver, std::string dsn,
 
     co_await conn.query("DROP TABLE IF EXISTS mig_users");
     co_await conn.query("DROP TABLE IF EXISTS __schema_migrations");
+    co_return;
+}
+
+// Exercises the with_transaction() unit-of-work helper end-to-end on a real
+// driver: commit on success, rollback on a returned error, and retry on a
+// transient error (begin → fn → rollback → re-begin → commit), driving the real
+// driver transaction machinery each attempt.
+inline Task<void> with_transaction_suite(IDBDriver& driver, std::string dsn,
+                                         std::string create_sql) {
+    namespace tdb = qbuem_routine::db;
+    using qbuem_routine::DbError;
+    using qbuem_routine::db_error;
+
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    co_await conn->query("DROP TABLE IF EXISTS wtx");
+    IT_CHECK((co_await conn->query(create_sql)).has_value());
+
+    auto count = [&conn]() -> Task<int64_t> {
+        auto rs = co_await conn->query("SELECT COUNT(*) FROM wtx");
+        if (!rs) co_return -1;
+        const IRow* row = co_await (*rs)->next();
+        co_return row ? row->get(0).get<int64_t>() : -1;
+    };
+
+    // 1. Commit path: an insert inside the block is persisted.
+    {
+        auto r = co_await tdb::with_transaction(*conn,
+            [](tdb::ITransaction& tx) -> Task<Result<void>> {
+                const Value row[] = {Value{int64_t{1}}, Value{int64_t{100}}};
+                auto e = co_await tx.execute("INSERT INTO wtx(id, n) VALUES($1, $2)", row);
+                if (!e) co_return unexpected(e.error());
+                co_return Result<void>{};
+            });
+        IT_CHECK(r.has_value());
+        IT_CHECK((co_await count()) == 1);
+    }
+
+    // 2. Rollback path: the block inserts but then returns an error → not persisted.
+    {
+        auto r = co_await tdb::with_transaction(*conn,
+            [](tdb::ITransaction& tx) -> Task<Result<void>> {
+                const Value row[] = {Value{int64_t{2}}, Value{int64_t{200}}};
+                (void)co_await tx.execute("INSERT INTO wtx(id, n) VALUES($1, $2)", row);
+                co_return unexpected(db_error(DbError::QueryFailed)); // force rollback
+            });
+        IT_CHECK(!r.has_value());
+        IT_CHECK((co_await count()) == 1); // id=2 rolled back
+    }
+
+    // 3. Retry path: transient-fail twice, succeed on the 3rd attempt.
+    {
+        int attempts = 0;
+        auto r = co_await tdb::with_transaction(*conn,
+            [&attempts](tdb::ITransaction& tx) -> Task<Result<void>> {
+                ++attempts;
+                const Value row[] = {Value{int64_t{3}}, Value{int64_t{300}}};
+                auto e = co_await tx.execute("INSERT INTO wtx(id, n) VALUES($1, $2)", row);
+                if (!e) co_return unexpected(e.error());
+                if (attempts < 3) // transient → with_transaction rolls back + retries
+                    co_return unexpected(db_error(DbError::Deadlock));
+                co_return Result<void>{};
+            });
+        IT_CHECK(r.has_value());
+        IT_CHECK(attempts == 3);            // retried exactly twice
+        IT_CHECK((co_await count()) == 2);  // id=3 committed once (ids 1 and 3)
+    }
+
+    co_await conn->query("DROP TABLE IF EXISTS wtx");
     co_return;
 }
 

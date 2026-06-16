@@ -24,6 +24,14 @@ namespace {
 // $N → ? placeholder conversion: shared, string-literal-aware implementation.
 using qbuem_routine::db_detail::convert_placeholders;
 
+// Map a busy/locked step result to a transient (retryable) DbError, else the
+// given fallback. Lets with_transaction() retry contended writes.
+static DbError sqlite_transient_or(int rc, DbError fallback) {
+    const int primary = rc & 0xFF; // strip extended-result-code bits
+    if (primary == SQLITE_BUSY || primary == SQLITE_LOCKED) return DbError::LockTimeout;
+    return fallback;
+}
+
 // ─── CellData — stores a single column value ─────────────────────────────────
 
 struct CellData {
@@ -325,7 +333,7 @@ public:
         sqlite3_finalize(stmt);
 
         if (rc != SQLITE_DONE && rc != SQLITE_ROW)
-            co_return unexpected(db_error(DbError::QueryFailed));
+            co_return unexpected(db_error(sqlite_transient_or(rc, DbError::QueryFailed)));
         co_return affected;
     }
 
@@ -336,7 +344,7 @@ private:
         int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err);
         if (rc != SQLITE_OK) {
             sqlite3_free(err);
-            return unexpected(db_error(DbError::TransactionFailed));
+            return unexpected(db_error(sqlite_transient_or(rc, DbError::TransactionFailed)));
         }
         return {};
     }

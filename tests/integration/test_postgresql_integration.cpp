@@ -26,6 +26,9 @@ int main() {
         co_await qbuem_db_it::migration_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
             qbuem_routine::migration::PlaceholderStyle::Dollar);
+        co_await qbuem_db_it::with_transaction_suite(
+            *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb",
+            "CREATE TABLE wtx(id BIGINT PRIMARY KEY, n BIGINT)");
         co_await qbuem_db_it::drain_safety_suite(
             *driver, dsn ? dsn : "postgresql://postgres:test@localhost:5433/testdb");
     });

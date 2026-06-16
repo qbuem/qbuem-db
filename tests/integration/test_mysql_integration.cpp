@@ -26,6 +26,9 @@ int main() {
         co_await qbuem_db_it::migration_suite(
             *driver, dsn ? dsn : default_dsn,
             qbuem_routine::migration::PlaceholderStyle::Question);
+        co_await qbuem_db_it::with_transaction_suite(
+            *driver, dsn ? dsn : default_dsn,
+            "CREATE TABLE wtx(id BIGINT PRIMARY KEY, n BIGINT)");
         co_await qbuem_db_it::drain_safety_suite(*driver, dsn ? dsn : default_dsn);
     });
 }
