@@ -978,6 +978,24 @@ void PgAcquireAwaiter::await_suspend(std::coroutine_handle<> h) noexcept {
 // ─── PgConnection::~PgConnection ─────────────────────────────────────────────
 
 PgConnection::~PgConnection() {
+    // Roll back any transaction the holder left open (or that aborted) before the
+    // slot returns to the pool, so transaction state never bleeds into the next
+    // user of this pooled connection.  PQtransactionStatus is a local check, so
+    // the normal (already-committed / never-began) path costs no round-trip;
+    // PQexec runs only when actually mid-transaction.  Best-effort and synchronous
+    // — this runs on the reactor thread before release(), and between operations
+    // the connection has no in-flight result (query() drains trailing results).
+    if (slot_) {
+        std::lock_guard lk{slot_->mutex};
+        PGconn* c = slot_->conn;
+        if (c && PQstatus(c) == CONNECTION_OK) {
+            const PGTransactionStatusType ts = PQtransactionStatus(c);
+            if (ts == PQTRANS_INTRANS || ts == PQTRANS_INERROR) {
+                PGresult* r = PQexec(c, "ROLLBACK");
+                if (r) PQclear(r);
+            }
+        }
+    }
     if (pool_) pool_->release(idx_);
 }
 

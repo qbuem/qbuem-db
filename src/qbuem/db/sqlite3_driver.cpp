@@ -22,13 +22,13 @@ namespace {
 // $N → ? placeholder conversion: shared, string-literal-aware implementation.
 using qbuem_routine::db_detail::convert_placeholders;
 
-// ─── CellData — 단일 컬럼 값 저장 ───────────────────────────────────────────
+// ─── CellData — stores a single column value ─────────────────────────────────
 
 struct CellData {
     Value::Type type = Value::Type::Null;
     int64_t     i64  = 0;
     double      f64  = 0.0;
-    std::string text; // TEXT / BLOB 모두 여기에 저장 (소유권 보장)
+    std::string text; // holds both TEXT and BLOB (owns the bytes)
 };
 
 // ─── Row ─────────────────────────────────────────────────────────────────────
@@ -110,7 +110,7 @@ private:
     uint64_t                                  last_id_;
 };
 
-// ─── 헬퍼: 파라미터 바인딩 ────────────────────────────────────────────────────
+// ─── Helper: parameter binding ────────────────────────────────────────────────
 
 static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
     switch (v.type()) {
@@ -126,7 +126,7 @@ static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
             break;
         case Value::Type::Text: {
             auto sv = v.get<std::string_view>();
-            // SQLITE_STATIC: params span은 sqlite3_step 완료까지 유효
+            // SQLITE_STATIC: the params span stays valid until sqlite3_step completes
             sqlite3_bind_text(stmt, idx, sv.data(),
                               static_cast<int>(sv.size()), SQLITE_STATIC);
             break;
@@ -140,7 +140,7 @@ static void bind_value(sqlite3_stmt* stmt, int idx, const Value& v) {
     }
 }
 
-// ─── 헬퍼: 컬럼 값 읽기 ──────────────────────────────────────────────────────
+// ─── Helper: read a column value ──────────────────────────────────────────────
 
 static CellData read_column(sqlite3_stmt* stmt, int col) {
     CellData c;
@@ -174,7 +174,7 @@ static CellData read_column(sqlite3_stmt* stmt, int col) {
     return c;
 }
 
-// ─── 헬퍼: stmt 실행 → ResultSet 빌드 ───────────────────────────────────────
+// ─── Helper: execute stmt → build ResultSet ──────────────────────────────────
 
 static Result<std::unique_ptr<IResultSet>>
 run_stmt(sqlite3* db, sqlite3_stmt* stmt, std::span<const Value> params) {
@@ -323,6 +323,17 @@ public:
     SqliteConnection(sqlite3* db, std::mutex& mx)
         : db_(db), mx_(mx) {}
 
+    ~SqliteConnection() override {
+        // Roll back a transaction the holder left open (BEGIN with no COMMIT/
+        // ROLLBACK) so it never bleeds into the next user of this pooled
+        // connection.  The driver shares one sqlite3* across handles, so an open
+        // transaction would otherwise persist.  sqlite3_get_autocommit()==0 means
+        // a transaction is still active; it costs nothing on the normal path.
+        std::lock_guard lock{mx_};
+        if (db_ && sqlite3_get_autocommit(db_) == 0)
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+
     ConnectionState state() const noexcept override { return state_; }
 
     Task<Result<std::unique_ptr<IStatement>>>
@@ -397,15 +408,15 @@ public:
         // writer holds the lock — essential under WAL with concurrent writers,
         // otherwise transient contention surfaces as hard query failures.
         sqlite3_busy_timeout(db_, 5000); // 5s
-        // WAL 모드: 동시 읽기 허용, 쓰기 직렬화
+        // WAL mode: allows concurrent readers, serializes writers
         sqlite3_exec(db_, "PRAGMA journal_mode=WAL",        nullptr, nullptr, nullptr);
         sqlite3_exec(db_, "PRAGMA synchronous=NORMAL",      nullptr, nullptr, nullptr);
         sqlite3_exec(db_, "PRAGMA foreign_keys=ON",         nullptr, nullptr, nullptr);
-        // 성능 최적화
-        sqlite3_exec(db_, "PRAGMA cache_size=-65536",       nullptr, nullptr, nullptr); // 64MB 페이지 캐시
-        sqlite3_exec(db_, "PRAGMA temp_store=MEMORY",       nullptr, nullptr, nullptr); // 임시 테이블 메모리
+        // Performance tuning
+        sqlite3_exec(db_, "PRAGMA cache_size=-65536",       nullptr, nullptr, nullptr); // 64MB page cache
+        sqlite3_exec(db_, "PRAGMA temp_store=MEMORY",       nullptr, nullptr, nullptr); // temp tables in memory
         sqlite3_exec(db_, "PRAGMA mmap_size=268435456",     nullptr, nullptr, nullptr); // 256MB mmap
-        sqlite3_exec(db_, "PRAGMA page_size=4096",          nullptr, nullptr, nullptr); // 4KB 페이지 (신규 DB만)
+        sqlite3_exec(db_, "PRAGMA page_size=4096",          nullptr, nullptr, nullptr); // 4KB pages (new DB only)
     }
 
     ~SqliteConnectionPool() override {
@@ -453,10 +464,10 @@ public:
         return dsn.starts_with("sqlite://");
     }
 
-    // sqlite:///path/to/file.db  또는  sqlite://:memory:
+    // sqlite:///path/to/file.db  or  sqlite://:memory:
     Task<Result<std::unique_ptr<IConnectionPool>>>
     pool(std::string_view dsn, PoolConfig /*config*/) override {
-        std::string_view path = dsn.substr(9); // "sqlite://" 제거
+        std::string_view path = dsn.substr(9); // strip "sqlite://"
         auto p = std::make_unique<SqliteConnectionPool>(path);
         if (!p->is_valid())
             co_return unexpected(
@@ -467,7 +478,7 @@ public:
 
 } // anonymous namespace
 
-// ─── 팩토리 ────────────────────────────────────────────────────────────────────
+// ─── Factory ──────────────────────────────────────────────────────────────────
 
 std::unique_ptr<qbuem::db::IDBDriver> make_sqlite_driver() {
     return std::make_unique<SqliteDriver>();

@@ -198,6 +198,66 @@ inline Task<void> large_value_suite(IDBDriver& driver, std::string dsn) {
     co_return;
 }
 
+// Transaction / session state must not bleed across pooled connection reuse: a
+// connection returned to the pool with an open (or aborted) transaction must be
+// reset before the next holder receives it.  Uses a single-slot pool so the same
+// physical connection is guaranteed to be reused.
+inline Task<void> txn_isolation_suite(IDBDriver& driver, std::string dsn) {
+    PoolConfig cfg;
+    cfg.min_size = 1;
+    cfg.max_size = 1;
+    auto pool_r = co_await driver.pool(dsn, cfg);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+
+    // Fresh table.
+    {
+        auto c0 = co_await pool->acquire();
+        IT_CHECK(c0.has_value());
+        if (!c0) co_return;
+        auto conn0 = std::move(*c0);
+        co_await conn0->query("DROP TABLE IF EXISTS itxn");
+        IT_CHECK((co_await conn0->query(
+            "CREATE TABLE itxn(id BIGINT PRIMARY KEY)")).has_value());
+    }
+
+    // Holder leaves a transaction open: BEGIN + INSERT, then drops the handles
+    // without COMMIT or ROLLBACK — the connection returns to the pool mid-txn.
+    {
+        auto c1 = co_await pool->acquire();
+        IT_CHECK(c1.has_value());
+        if (!c1) co_return;
+        auto conn1 = std::move(*c1);
+        auto tx_r = co_await conn1->begin();
+        IT_CHECK(tx_r.has_value());
+        if (tx_r) {
+            auto tx = std::move(*tx_r);
+            const Value ins[] = {Value{int64_t{777}}};
+            (void)co_await tx->execute("INSERT INTO itxn(id) VALUES($1)", ins);
+        }
+    }
+
+    // Next holder reuses the same connection.  It must see clean state:
+    //   * the uncommitted INSERT is gone (rolled back), and
+    //   * queries are not blocked by a leftover open/aborted transaction.
+    {
+        auto c2 = co_await pool->acquire();
+        IT_CHECK(c2.has_value());
+        if (!c2) co_return;
+        auto conn2 = std::move(*c2);
+        auto rs_r = co_await conn2->query("SELECT COUNT(*) FROM itxn");
+        IT_CHECK(rs_r.has_value()); // not blocked by a leftover transaction
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row && row->get(0).get<int64_t>() == 0); // INSERT rolled back
+        }
+        co_await conn2->query("DROP TABLE IF EXISTS itxn");
+    }
+    co_return;
+}
+
 // Run `body` to completion; returns process exit code (0 = all checks passed).
 template <typename F>
 inline int run_main(F&& body) {

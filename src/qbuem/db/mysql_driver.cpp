@@ -470,6 +470,11 @@ struct MysqlSlot {
     MYSQL*             conn{nullptr};
     std::mutex         mutex;
     Clock::time_point  idle_since{Clock::now()};
+    // Set when begin() opens a transaction, cleared on commit()/rollback().  Lets
+    // the connection destructor roll back a transaction the holder left open so it
+    // never bleeds into the next user of this pooled connection.  (libmysqlclient
+    // exposes no public "in transaction?" query, hence this explicit flag.)
+    bool               in_txn{false};
 
     explicit MysqlSlot(MYSQL* c) noexcept : conn(c) {}
     ~MysqlSlot() { if (conn) { mysql_close(conn); conn = nullptr; } }
@@ -545,11 +550,15 @@ public:
 
     Task<Result<void>> commit() override {
         std::lock_guard lock{mx_};
-        co_return exec_sql("COMMIT");
+        auto r = exec_sql("COMMIT");
+        slot_->in_txn = false; // transaction finalized (even on error: it is over)
+        co_return r;
     }
     Task<Result<void>> rollback() override {
         std::lock_guard lock{mx_};
-        co_return exec_sql("ROLLBACK");
+        auto r = exec_sql("ROLLBACK");
+        slot_->in_txn = false;
+        co_return r;
     }
     Task<Result<void>> savepoint(std::string_view name) override {
         if (!db_detail::is_safe_ident(name))
@@ -625,6 +634,7 @@ public:
                 co_return unexpected(db_error(DbError::TransactionFailed));
             if (mysql_query(db_, "START TRANSACTION"))
                 co_return unexpected(db_error(DbError::TransactionFailed));
+            slot_->in_txn = true;
         }
         state_ = ConnectionState::Transaction;
         co_return std::make_unique<MysqlTransaction>(slot_);
@@ -763,6 +773,17 @@ private:
 // ─── MysqlConnection::~MysqlConnection implementation ─────────────────────────
 
 MysqlConnection::~MysqlConnection() {
+    // Roll back a transaction the holder left open (begin() with no commit/
+    // rollback) before the slot returns to the pool, so transaction state never
+    // bleeds into the next user of this pooled connection.  Only touches the wire
+    // when in_txn is set, so the normal path costs no extra round-trip.
+    if (slot_ && slot_->conn) {
+        std::lock_guard lk{slot_->mutex};
+        if (slot_->in_txn) {
+            mysql_query(slot_->conn, "ROLLBACK");
+            slot_->in_txn = false;
+        }
+    }
     if (pool_) pool_->release(slot_idx_);
 }
 

@@ -9,6 +9,7 @@ int main() {
             *driver, "sqlite://:memory:",
             "CREATE TABLE itest(id INTEGER PRIMARY KEY, name TEXT)");
         co_await qbuem_db_it::large_value_suite(*driver, "sqlite://:memory:");
+        co_await qbuem_db_it::txn_isolation_suite(*driver, "sqlite://:memory:");
         co_await qbuem_db_it::drain_safety_suite(*driver, "sqlite://:memory:");
     });
 }
