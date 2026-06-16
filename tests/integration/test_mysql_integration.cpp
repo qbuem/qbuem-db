@@ -23,6 +23,9 @@ int main() {
             "name VARCHAR(255), age BIGINT)");
         co_await qbuem_db_it::txn_isolation_suite(*driver, dsn ? dsn : default_dsn);
         co_await qbuem_db_it::multi_connection_suite(*driver, dsn ? dsn : default_dsn);
+        co_await qbuem_db_it::migration_suite(
+            *driver, dsn ? dsn : default_dsn,
+            qbuem_routine::migration::PlaceholderStyle::Question);
         co_await qbuem_db_it::drain_safety_suite(*driver, dsn ? dsn : default_dsn);
     });
 }

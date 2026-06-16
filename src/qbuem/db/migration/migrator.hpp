@@ -67,6 +67,7 @@
 #include <qbuem/core/task.hpp>
 #include <qbuem/db/driver.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <optional>
@@ -188,10 +189,12 @@ public:
     // ── Initialization — create the __schema_migrations table ────────────────
 
     Task<Result<void>> init() {
+        // NB: description is TEXT NOT NULL with no DEFAULT — MySQL forbids a
+        // DEFAULT on TEXT/BLOB columns, and apply_one always supplies it anyway.
         const std::string sql = std::format(R"sql(
             CREATE TABLE IF NOT EXISTS __schema_migrations (
                 version     BIGINT      NOT NULL PRIMARY KEY,
-                description TEXT        NOT NULL DEFAULT '',
+                description TEXT        NOT NULL,
                 applied_at  {}  NOT NULL DEFAULT {}
             )
         )sql",
@@ -222,7 +225,8 @@ public:
         const std::string sql = std::format(
             "SELECT 1 FROM __schema_migrations WHERE version = {}",
             ph(1));
-        auto r = co_await conn_.query(sql, {Value{static_cast<int64_t>(version)}});
+        const Value params[] = {Value{static_cast<int64_t>(version)}};
+        auto r = co_await conn_.query(sql, params);
         if (!r) co_return unexpected(r.error());
         co_return (co_await (*r)->next()) != nullptr;
     }
@@ -407,10 +411,11 @@ private:
         const std::string insert = std::format(
             "INSERT INTO __schema_migrations(version, description) VALUES ({}, {})",
             ph(1), ph(2));
-        auto ins_r = co_await txn->execute(insert, {
+        const Value ins_params[] = {
             Value{static_cast<int64_t>(m.version)},
             Value{std::string_view{m.description}},
-        });
+        };
+        auto ins_r = co_await txn->execute(insert, ins_params);
         if (!ins_r) {
             co_await txn->rollback();
             co_return unexpected(migration_error(2));
@@ -442,9 +447,8 @@ private:
         // Remove history
         const std::string del = std::format(
             "DELETE FROM __schema_migrations WHERE version = {}", ph(1));
-        auto del_r = co_await txn->execute(del, {
-            Value{static_cast<int64_t>(m.version)},
-        });
+        const Value del_params[] = {Value{static_cast<int64_t>(m.version)}};
+        auto del_r = co_await txn->execute(del, del_params);
         if (!del_r) {
             co_await txn->rollback();
             co_return unexpected(migration_error(3));

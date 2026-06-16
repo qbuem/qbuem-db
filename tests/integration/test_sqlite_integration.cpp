@@ -19,6 +19,9 @@ int main() {
         // private ":memory:" database.
         co_await qbuem_db_it::multi_connection_suite(
             *driver, "sqlite://file:qbuem_it_multiconn?mode=memory&cache=shared");
+        co_await qbuem_db_it::migration_suite(
+            *driver, "sqlite://:memory:",
+            qbuem_routine::migration::PlaceholderStyle::Question);
         co_await qbuem_db_it::drain_safety_suite(*driver, "sqlite://:memory:");
     });
 }
