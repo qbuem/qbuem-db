@@ -228,16 +228,24 @@ static MYSQL* create_connection(const MysqlDsn& dsn) {
     // guarantees; the pool reconnects explicitly via ping().  It is also removed
     // in MySQL 8.3+.
     if (dsn.use_ssl) {
-        // MYSQL_OPT_SSL_MODE is the modern replacement for the removed
-        // MYSQL_OPT_SSL_ENFORCE (it takes an unsigned-int enum, not a bool).
-#ifdef MYSQL_OPT_SSL_MODE
+        // MYSQL_OPT_SSL_MODE (a mysql_option ENUMERATOR, not a macro — guard on
+        // the library version, not #ifdef) replaced the removed
+        // MYSQL_OPT_SSL_ENFORCE.  Takes an unsigned-int enum value.
+#if MYSQL_VERSION_ID >= 50711
         unsigned int ssl_mode = SSL_MODE_REQUIRED;
         mysql_options(conn, MYSQL_OPT_SSL_MODE, &ssl_mode);
-#elif defined(MYSQL_OPT_SSL_ENFORCE)
-        const bool ssl_enforce = true;
-        mysql_options(conn, MYSQL_OPT_SSL_ENFORCE, &ssl_enforce);
 #endif
     }
+
+    // Allow caching_sha2_password (the MySQL 8+/9 DEFAULT auth plugin) to
+    // complete over a non-TLS connection by fetching the server's RSA public
+    // key.  Without this, the very first connection to a stock MySQL 8/9 server
+    // fails unless SSL is configured — a common production foot-gun.  The
+    // option is a MySQL-8.0.4+ enumerator (absent on MariaDB).
+#if MYSQL_VERSION_ID >= 80004 && !defined(MARIADB_VERSION_ID) && !defined(MARIADB_BASE_VERSION)
+    bool get_server_public_key = true;
+    mysql_options(conn, MYSQL_OPT_GET_SERVER_PUBLIC_KEY, &get_server_public_key);
+#endif
 
     // TCP keepalive — 클라우드 방화벽 idle 연결 drop 대응
 #ifdef MYSQL_OPT_TCP_KEEPIDLE
