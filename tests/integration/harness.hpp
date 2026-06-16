@@ -653,6 +653,85 @@ inline Task<void> timeout_configured_suite(IDBDriver& driver, std::string dsn,
     co_return;
 }
 
+// Exercises streaming result sets: a full lazy scan over many rows (verifying
+// every row is correct and the count matches), then a partial scan that is
+// abandoned mid-stream (the result set is destroyed before exhaustion — ASan
+// confirms the underlying statement/cursor is cleaned up), and finally a query
+// on the same connection afterwards (it must remain usable).
+inline Task<void> streaming_suite(IDBDriver& driver, std::string dsn,
+                                  std::string create_sql) {
+    auto pool_r = co_await driver.pool(dsn);
+    IT_CHECK(pool_r.has_value());
+    if (!pool_r) co_return;
+    auto pool = std::move(*pool_r);
+    auto conn_r = co_await pool->acquire();
+    IT_CHECK(conn_r.has_value());
+    if (!conn_r) co_return;
+    auto conn = std::move(*conn_r);
+
+    co_await conn->query("DROP TABLE IF EXISTS strm");
+    IT_CHECK((co_await conn->query(create_sql)).has_value());
+
+    const int N = 2000;
+    {
+        auto tx_r = co_await conn->begin();
+        IT_CHECK(tx_r.has_value());
+        if (!tx_r) co_return;
+        auto tx = std::move(*tx_r);
+        for (int i = 0; i < N; ++i) {
+            const Value row[] = {Value{int64_t{i}}, Value{int64_t{i * 2}}};
+            auto e = co_await tx->execute("INSERT INTO strm(id, n) VALUES($1, $2)", row);
+            if (!e) { IT_CHECK(false); break; }
+        }
+        IT_CHECK((co_await tx->commit()).has_value());
+    }
+
+    // Full lazy scan — every row read one at a time, in order.
+    {
+        auto rs_r = co_await conn->query("SELECT id, n FROM strm ORDER BY id");
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            int seen = 0;
+            while (const IRow* row = co_await rs->next()) {
+                if (row->get(0).get<int64_t>() != seen ||
+                    row->get(1).get<int64_t>() != int64_t{seen} * 2) {
+                    IT_CHECK(false);
+                    break;
+                }
+                ++seen;
+            }
+            IT_CHECK(seen == N); // every streamed row accounted for
+        }
+    }
+
+    // Partial scan then abandon: destroy the result set after a few rows. The
+    // streaming statement must be cleaned up (no leak / use-after-free under ASan).
+    {
+        auto rs_r = co_await conn->query("SELECT id, n FROM strm ORDER BY id");
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            for (int i = 0; i < 3; ++i) IT_CHECK((co_await rs->next()) != nullptr);
+            // rs goes out of scope here, mid-stream.
+        }
+    }
+
+    // The connection is still usable after abandoning a stream.
+    {
+        auto rs_r = co_await conn->query("SELECT COUNT(*) FROM strm");
+        IT_CHECK(rs_r.has_value());
+        if (rs_r) {
+            auto rs = std::move(*rs_r);
+            const IRow* row = co_await rs->next();
+            IT_CHECK(row && row->get(0).get<int64_t>() == N);
+        }
+    }
+
+    co_await conn->query("DROP TABLE IF EXISTS strm");
+    co_return;
+}
+
 // Run `body` to completion; returns process exit code (0 = all checks passed).
 template <typename F>
 inline int run_main(F&& body) {
