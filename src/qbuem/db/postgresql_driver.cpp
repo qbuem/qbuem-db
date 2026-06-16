@@ -346,10 +346,25 @@ private:
     uint64_t affected_, last_id_;
 };
 
+// Map a failed result's SQLSTATE to a transient (retryable) DbError where it
+// applies, otherwise return `fallback`. Lets with_transaction() retry real
+// serialization failures / deadlocks instead of surfacing them as generic errors.
+static DbError pg_transient_or(PGresult* res, DbError fallback) {
+    const char* ss = res ? PQresultErrorField(res, PG_DIAG_SQLSTATE) : nullptr;
+    if (ss) {
+        const std::string_view s{ss};
+        if (s == "40001") return DbError::SerializationFailure; // serialization_failure
+        if (s == "40P01") return DbError::Deadlock;             // deadlock_detected
+        if (s == "55P03") return DbError::LockTimeout;          // lock_not_available
+    }
+    return fallback;
+}
+
 static Result<std::unique_ptr<IResultSet>> build_result_set(PGresult* res) {
     const ExecStatusType status = PQresultStatus(res);
     if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-        PQclear(res); return unexpected(db_error(DbError::QueryFailed));
+        const DbError e = pg_transient_or(res, DbError::QueryFailed);
+        PQclear(res); return unexpected(db_error(e));
     }
     const int nrows = PQntuples(res), ncols = PQnfields(res);
     auto col_names = std::make_shared<std::vector<std::string>>();
@@ -692,8 +707,11 @@ private:
         res = co_await PgReadAwaiter{slot_->conn};
         if (!res) co_return unexpected(db_error(DbError::TransactionFailed));
         const ExecStatusType status = PQresultStatus(res);
+        // A serialization failure / deadlock is commonly reported at COMMIT —
+        // surface it as transient so with_transaction() retries the whole block.
+        const DbError e = pg_transient_or(res, DbError::TransactionFailed);
         PQclear(res);
-        if (status != PGRES_COMMAND_OK) co_return unexpected(db_error(DbError::TransactionFailed));
+        if (status != PGRES_COMMAND_OK) co_return unexpected(db_error(e));
         co_return {};
     }
 
