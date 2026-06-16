@@ -1,4 +1,5 @@
 #include "redis_client.hpp"
+#include "resp_parser.hpp"
 
 #include <qbuem/core/reactor.hpp>
 #include <qbuem/core/task.hpp>
@@ -90,133 +91,8 @@ static std::string encode_resp(const std::vector<std::string>& args) {
 }
 
 // ── RESP2 parser ─────────────────────────────────────────────────────────────
-
-class RespParser {
-public:
-    /// Append data to the internal buffer.
-    void feed(const char* data, size_t len) {
-        buf_.append(data, len);
-    }
-
-    /// Returns true if a complete RESP response is available to parse.
-    [[nodiscard]] bool has_complete() const {
-        std::size_t pos = 0;
-        return can_parse(pos);
-    }
-
-    /// Parse and consume a complete response (has_complete() must be true).
-    [[nodiscard]] RedisValue parse() {
-        std::size_t pos = 0;
-        auto val = parse_value(pos);
-        // O(1) clear() when fully consumed; O(n) erase() only for partial consumption
-        if (pos == buf_.size())
-            buf_.clear();
-        else
-            buf_.erase(0, pos);
-        return val;
-    }
-
-    [[nodiscard]] bool empty() const noexcept { return buf_.empty(); }
-
-private:
-    std::string buf_;
-
-    [[nodiscard]] bool can_parse(std::size_t& pos) const {
-        if (pos >= buf_.size()) return false;
-        const char prefix = buf_[pos];
-        switch (prefix) {
-            case '+': case '-': case ':': {
-                auto end = buf_.find("\r\n", pos + 1);
-                if (end == std::string::npos) return false;
-                pos = end + 2;
-                return true;
-            }
-            case '$': {
-                auto end = buf_.find("\r\n", pos + 1);
-                if (end == std::string::npos) return false;
-                int64_t len = -1;
-                std::from_chars(buf_.data() + pos + 1,
-                                buf_.data() + end, len);
-                if (len < 0) { pos = end + 2; return true; } // null bulk
-                if (pos + (end - pos) + 2 + len + 2 > buf_.size()) return false;
-                pos = end + 2 + len + 2;
-                return true;
-            }
-            case '*': {
-                auto end = buf_.find("\r\n", pos + 1);
-                if (end == std::string::npos) return false;
-                int64_t count = -1;
-                std::from_chars(buf_.data() + pos + 1,
-                                buf_.data() + end, count);
-                pos = end + 2;
-                if (count < 0) return true; // null array
-                for (int64_t i = 0; i < count; ++i)
-                    if (!can_parse(pos)) return false;
-                return true;
-            }
-            default: return false;
-        }
-    }
-
-    [[nodiscard]] RedisValue parse_value(std::size_t& pos) {
-        if (pos >= buf_.size()) return {};
-        const char prefix = buf_[pos++];
-        switch (prefix) {
-            case '+': {
-                auto end = buf_.find("\r\n", pos);
-                if (end == std::string::npos) return {};
-                RedisValue v; v.type = RedisValue::Type::String;
-                v.str = buf_.substr(pos, end - pos);
-                pos = end + 2;
-                return v;
-            }
-            case '-': {
-                auto end = buf_.find("\r\n", pos);
-                if (end == std::string::npos) return {};
-                RedisValue v; v.type = RedisValue::Type::Error;
-                v.str = buf_.substr(pos, end - pos);
-                pos = end + 2;
-                return v;
-            }
-            case ':': {
-                auto end = buf_.find("\r\n", pos);
-                if (end == std::string::npos) return {};
-                RedisValue v; v.type = RedisValue::Type::Integer;
-                std::from_chars(buf_.data() + pos,
-                                buf_.data() + end, v.integer);
-                pos = end + 2;
-                return v;
-            }
-            case '$': {
-                auto end = buf_.find("\r\n", pos);
-                if (end == std::string::npos) return {};
-                int64_t len = -1;
-                std::from_chars(buf_.data() + pos, buf_.data() + end, len);
-                pos = end + 2;
-                if (len < 0) return {}; // null bulk
-                RedisValue v; v.type = RedisValue::Type::String;
-                v.str = buf_.substr(pos, static_cast<size_t>(len));
-                pos += static_cast<size_t>(len) + 2;
-                return v;
-            }
-            case '*': {
-                auto end = buf_.find("\r\n", pos);
-                if (end == std::string::npos) return {};
-                int64_t count = -1;
-                std::from_chars(buf_.data() + pos, buf_.data() + end, count);
-                pos = end + 2;
-                if (count < 0) return {}; // null array
-                RedisValue v; v.type = RedisValue::Type::Array;
-                v.array.reserve(static_cast<size_t>(count));
-                for (int64_t i = 0; i < count; ++i)
-                    v.array.push_back(parse_value(pos));
-                return v;
-            }
-            default:
-                return {};
-        }
-    }
-};
+// The hardened, bounds-checked RespParser lives in resp_parser.hpp (extracted so
+// it can be unit-tested against crafted/untrusted server input without a socket).
 
 // ── Reactor-based async awaiters ─────────────────────────────────────────────
 
